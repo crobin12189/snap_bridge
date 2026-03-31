@@ -142,6 +142,7 @@ Wants=pipewire.service
 Type=simple
 User=$REAL_USER
 Environment=XDG_RUNTIME_DIR=/run/user/$USER_ID
+ExecStartPre=/bin/sleep 5
 ExecStartPre=/bin/bash -c 'test -p /tmp/snapfifo || mkfifo /tmp/snapfifo'
 ExecStart=/bin/bash -c '\\
     while true; do \\
@@ -206,6 +207,9 @@ chmod 440 /etc/sudoers.d/snapserver-restart
 
 # Add user to dialout group for UART access
 usermod -aG dialout "$REAL_USER"
+
+# Enable linger so PipeWire (user service) starts at boot without login
+loginctl enable-linger "$REAL_USER"
 
 # ── 9. Enable services ──
 echo ""
