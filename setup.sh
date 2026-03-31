@@ -65,7 +65,7 @@ grep -q "^g_audio" /etc/modules || echo "g_audio" >> /etc/modules
 
 # g_audio config: 96kHz 32bit stereo
 cat > /etc/modprobe.d/g_audio.conf << 'EOF'
-options g_audio c_chmask=3 p_chmask=3 c_srate=96000 p_srate=96000 c_ssize=4 p_ssize=4
+options g_audio c_chmask=3 p_chmask=0 c_srate=96000 p_srate=96000 c_ssize=4 p_ssize=4
 EOF
 
 # ── 4. Configure PipeWire for 96kHz native ──
