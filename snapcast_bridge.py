@@ -11,11 +11,13 @@ from typing import Optional
  
 import serial
  
+# ── Protocol constants (must match protocol.h) ──
 SYNC_0 = 0xAA
 SYNC_1 = 0x55
 HEADER_SIZE = 5
 MAX_PAYLOAD = 2048
  
+# Message types
 MSG_INIT           = 0x01
 MSG_VOL_SET        = 0x02
 MSG_VOL_MUTE       = 0x03
@@ -25,6 +27,7 @@ MSG_CLIENT_LIST    = 0x11
 MSG_CLIENT_VOL_UPD = 0x12
 MSG_PONG           = 0x13
  
+# Client entry sizes
 CLIENT_ID_LEN   = 36
 CLIENT_NAME_LEN = 32
 CLIENT_ENTRY_SIZE = CLIENT_ID_LEN + CLIENT_NAME_LEN + 3  # id + name + vol + muted + connected
@@ -36,6 +39,8 @@ logging.basicConfig(
 )
 log = logging.getLogger("bridge")
  
+ 
+# ── CRC-8 (polynomial 0x31, init 0x00) ──
 def crc8(data: bytes) -> int:
     crc = 0x00
     for b in data:
@@ -47,12 +52,16 @@ def crc8(data: bytes) -> int:
                 crc = (crc << 1) & 0xFF
     return crc
  
+ 
+# ── Frame builder ──
 def build_frame(msg_type: int, payload: bytes = b"") -> bytes:
     plen = len(payload)
     header = bytes([SYNC_0, SYNC_1, msg_type, plen & 0xFF, (plen >> 8) & 0xFF])
     crc_data = bytes([msg_type, plen & 0xFF, (plen >> 8) & 0xFF]) + payload
     return header + payload + bytes([crc8(crc_data)])
  
+ 
+# ── Snapcast JSON-RPC helper ──
 class SnapcastClient:
     """Connects to Snapcast server JSON-RPC TCP interface."""
  
@@ -154,6 +163,8 @@ class SnapcastClient:
  
         return notifications
  
+ 
+# ── Build CLIENT_LIST payload from Snapcast status ──
 def build_client_list_payload(status: dict) -> bytes:
     """Parse Snapcast Server.GetStatus and build binary CLIENT_LIST payload."""
     clients = []
@@ -192,6 +203,8 @@ def build_client_list_payload(status: dict) -> bytes:
  
     return payload
  
+ 
+# ── UART frame receiver ──
 class UARTReceiver:
     """State-machine UART frame receiver."""
  
@@ -261,6 +274,8 @@ class UARTReceiver:
                     log.warning("CRC mismatch: got 0x%02X expected 0x%02X", byte, expected)
                 self.state = self.SYNC_0_ST
  
+ 
+# ── Main bridge ──
 class SnapcastBridge:
     ESP_TIMEOUT_S = 20  # If no message from ESP in this many seconds, consider it lost
     SNAP_HEALTH_INTERVAL_S = 10  # Check snapserver health every N seconds
