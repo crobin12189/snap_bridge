@@ -220,6 +220,9 @@ systemctl enable snapserver
 systemctl enable snapcast-source
 systemctl enable uart-bridge
 
+echo 'net.ipv4.tcp_retries2 = 5' | sudo tee /etc/sysctl.d/99-tcp-retries.conf
+sudo sysctl -p /etc/sysctl.d/99-tcp-retries.conf
+
 echo ""
 echo "========================================="
 echo " Setup complete!"
