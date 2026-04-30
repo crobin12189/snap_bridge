@@ -65,7 +65,7 @@ grep -q "^g_audio" /etc/modules || echo "g_audio" >> /etc/modules
 
 # g_audio config: 96kHz 32bit stereo
 cat > /etc/modprobe.d/g_audio.conf << 'EOF'
-options g_audio c_chmask=3 p_chmask=0 c_srate=96000 p_srate=96000 c_ssize=3 p_ssize=3
+options g_audio c_chmask=3 p_chmask=0 c_srate=96000 p_srate=96000 c_ssize=4 p_ssize=4
 EOF
 
 # ── 4. Configure PipeWire for 96kHz native ──
@@ -101,7 +101,7 @@ cat > /etc/snapserver.conf << 'EOF'
 bind_to_address = 0.0.0.0
 port = 1704
 source = pipe:///tmp/snapfifo?name=USB_Audio&dryout_ms=2000
-sampleformat = 96000:24:2
+sampleformat = 96000:32:2
 codec = flac
 chunk_ms = 40
 buffer = 1500
@@ -148,7 +148,7 @@ ExecStart=/bin/bash -c '\\
     while true; do \\
         parec \\
             --device=alsa_input.platform-3f980000.usb.stereo-fallback \\
-            --format=s24le \\
+            --format=s32le \\
             --rate=96000 \\
             --channels=2 \\
             --latency-msec=10 \\
