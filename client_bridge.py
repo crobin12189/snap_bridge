@@ -576,7 +576,7 @@ class ClientBridge:
             time.sleep(1)
 
         self.send_state(force=True)
-
+    
     def enter_bt_mode(self):
         log.info("=== ENTERING BT MODE ===")
         self.mode = MODE_BT
