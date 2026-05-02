@@ -374,19 +374,6 @@ rm -rf "$REAL_HOME/.config/wireplumber" 2>/dev/null || true
 rm -rf "$REAL_HOME/.config/pipewire" 2>/dev/null || true
 rm -rf "$REAL_HOME/.config/systemd/user/wireplumber.service.d" 2>/dev/null || true
 
-# ── Enable OverlayFS (read-only root, protects SD card) ──
-# Must be last step before reboot
-echo ""
-echo "Enabling OverlayFS (read-only filesystem)..."
-
-# sigmadsp writes params at runtime — bind mount a tmpfs over it so it can still write
-# this is handled by overlayfs automatically since /var/lib goes to tmpfs overlay
-# but we make sure /var/lib/sigmadsp exists before enabling
-mkdir -p /var/lib/sigmadsp
-
-# Enable overlayfs via raspi-config
-raspi-config nonint enable_overlayfs
-
 echo ""
 echo "========================================="
 echo " Setup complete!"
