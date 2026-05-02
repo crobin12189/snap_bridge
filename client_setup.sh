@@ -51,7 +51,9 @@ apt install -y \
     bluez-tools=2.0~20170911.0.7cb788c-4 \
     snapclient=0.26.0+dfsg1-1+deb12u1 \
     python3-serial=3.5-1.1 \
-    avahi-daemon
+    avahi-daemon \
+    git \
+    python3-dev
 
 # Prevent auto-upgrades
 apt-mark hold \
@@ -287,15 +289,13 @@ fi
 echo ""
 echo "[14/14] Installing sigmadsp backend..."
 
-# Install dependencies
-apt-get install -y git python3-dev
 
-# Clone your fork
+# Clone fork and run install.sh
 sudo -u "$REAL_USER" git clone https://github.com/crobin12189/sigmadsp.git "$REAL_HOME/sigmadsp" || true
-
-# Run install script as real user (handles pipx install internally)
 cd "$REAL_HOME/sigmadsp"
-sudo -u "$REAL_USER" bash install.sh <<< "n"
+set +e
+(sudo -u "$REAL_USER" bash install.sh <<< "n")
+set -e
 
 # Fix gpiozero FIRST before creating service — 1.6.2 has pkg_resources bug, 2.0.1 works fine
 # despite version constraint warning from pipx
