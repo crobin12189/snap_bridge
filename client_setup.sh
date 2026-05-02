@@ -295,10 +295,11 @@ sudo -u "$REAL_USER" git clone https://github.com/crobin12189/sigmadsp.git "$REA
 
 # Run install script as real user (handles pipx install internally)
 cd "$REAL_HOME/sigmadsp"
-sudo -u "$REAL_USER" bash install.sh
+sudo -u "$REAL_USER" bash install.sh <<< "n"
 
-# Fix gpiozero version — 1.6.2 has a pkg_resources bug, 2.0.1 works fine
-# despite the version constraint warning from pipx
+# Fix gpiozero FIRST before creating service — 1.6.2 has pkg_resources bug, 2.0.1 works fine
+# despite version constraint warning from pipx
+echo "Upgrading gpiozero to 2.0.1..."
 VENV_PIP="$REAL_HOME/.local/pipx/venvs/sigmadsp/bin/python"
 sudo -u "$REAL_USER" $VENV_PIP -m pip install "gpiozero==2.0.1" --force-reinstall
 
