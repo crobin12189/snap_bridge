@@ -105,6 +105,21 @@ def save_password_hash(h: str):
     log.info("Password hash saved to %s", PW_HASH_FILE)
 
 
+def fetch_hash_from_server(server_ip: str) -> Optional[str]:
+    """Connect to server Pi port 7701 and pull current hash."""
+    try:
+        with socket.create_connection((server_ip, 7701), timeout=5) as s:
+            data = s.recv(64)
+        if len(data) == 64:
+            h = data.decode("ascii", errors="replace")
+            log.info("Fetched hash from server %s", server_ip)
+            return h
+        log.warning("Hash pull got wrong length: %d", len(data))
+        return None
+    except OSError as e:
+        log.warning("Hash pull failed: %s", e)
+        return None
+
 # ── UART frame receiver ──
 class UARTReceiver:
     SYNC_0_ST  = 0
@@ -625,7 +640,6 @@ class ClientBridge:
                 self.send_state(force=True)
 
     # ── Mode transitions ──
-
     def enter_sync_mode(self):
         log.info("=== ENTERING SYNC MODE ===")
         self.mode = MODE_SYNC
@@ -654,11 +668,17 @@ class ClientBridge:
                     vol = self.rpc.get_volume_for_client(self.client_id)
                     if vol is not None:
                         self.volume = vol
+                    # Pull latest password hash from server
+                    fetched = fetch_hash_from_server(self.server_ip)
+                    if fetched:
+                        save_password_hash(fetched)
+                        self._pw_hash = fetched
                     break
             time.sleep(1)
 
         self.send_state(force=True)
 
+        
     def enter_bt_mode(self):
         log.info("=== ENTERING BT MODE ===")
         self.mode = MODE_BT
