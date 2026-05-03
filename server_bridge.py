@@ -217,6 +217,28 @@ def build_client_list_payload(status: dict) -> bytes:
 
     return payload
 
+class HashPullServer(threading.Thread):
+    """Listens on TCP 7701 — any client that connects gets the current hash."""
+
+    def __init__(self, get_hash_fn):
+        super().__init__(daemon=True)
+        self._get_hash = get_hash_fn
+
+    def run(self):
+        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind(("0.0.0.0", 7701))
+        srv.listen(10)
+        log.info("Hash pull server listening on port 7701")
+        while True:
+            try:
+                conn, addr = srv.accept()
+                with conn:
+                    h = self._get_hash()
+                    conn.sendall(h.encode("ascii"))
+                log.info("Sent hash to %s on pull request", addr[0])
+            except Exception as e:
+                log.error("Hash pull server error: %s", e)
 
 # ── UART frame receiver ──
 class UARTReceiver:
@@ -356,6 +378,8 @@ class SnapcastBridge:
         self._last_snap_health_check = time.time()
         self._esp_vol_set_time = {}  # client_id -> timestamp, for echo suppression
         self._pw_hash, self._pw_user_set = load_or_init_password()
+        self._hash_pull_server = HashPullServer(lambda: self._pw_hash)
+        self._hash_pull_server.start()
 
     def send_frame(self, msg_type: int, payload: bytes = b""):
         frame = build_frame(msg_type, payload)
@@ -384,6 +408,9 @@ class SnapcastBridge:
             log.info("Sent ACK")
             time.sleep(0.1)
             self.fetch_and_send_clients()
+            # Tell ESP whether user has set a password yet
+            self.send_frame(MSG_PW_ACK, bytes([1 if self._pw_user_set else 0]))
+            log.info("Sent PW_ACK: user_set=%s", self._pw_user_set)
 
         elif msg_type == MSG_PING:
             self.send_frame(MSG_PONG)
