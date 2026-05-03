@@ -237,6 +237,12 @@ wget -O "$BRIDGE_DIR/client_bridge.py" \
 
 chmod +x "$BRIDGE_DIR/client_bridge.py"
 
+
+# ── Password hash file ──
+touch /etc/zone_password.hash
+chown "$REAL_USER:$REAL_USER" /etc/zone_password.hash
+chmod 640 /etc/zone_password.hash
+
 cat > /etc/systemd/system/esp-bridge.service << SVCEOF
 [Unit]
 Description=ESP UART Bridge (Snapcast + BT)
@@ -259,14 +265,16 @@ SVCEOF
 systemctl daemon-reload
 systemctl enable esp-bridge.service
 
-# ── 11. Sudo permissions for snapclient control ──
+# ── 11. Sudo permissions ──
 echo ""
 echo "[11/14] Configuring sudoers..."
 
-echo "$REAL_USER ALL=(ALL) NOPASSWD: /bin/systemctl start snapclient, /bin/systemctl stop snapclient" \
-    > /etc/sudoers.d/esp-bridge
+cat > /etc/sudoers.d/esp-bridge << SUDOEOF
+$REAL_USER ALL=(ALL) NOPASSWD: /bin/systemctl start snapclient
+$REAL_USER ALL=(ALL) NOPASSWD: /bin/systemctl stop snapclient
+$REAL_USER ALL=(ALL) NOPASSWD: /usr/bin/hostnamectl set-hostname *
+SUDOEOF
 chmod 440 /etc/sudoers.d/esp-bridge
-
 # ── 12. Enable user linger ──
 echo ""
 echo "[12/14] Enabling user linger..."
@@ -394,6 +402,7 @@ echo "   /etc/bluetooth/main.conf"
 echo "   /etc/default/snapclient"
 echo "   /etc/avahi/avahi-daemon.conf"
 echo "   /var/lib/sigmadsp/config.yaml"
+echo "   /etc/zone_password.hash (password hash, seeded on first bridge run)"
 echo ""
 echo " Bridge script: $BRIDGE_DIR/client_bridge.py"
 echo " SigmaDSP repo: $REAL_HOME/sigmadsp"
