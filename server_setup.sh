@@ -180,6 +180,11 @@ chown -R "$REAL_USER:$REAL_USER" "$BRIDGE_DIR"
 sudo -u "$REAL_USER" python3 -m venv "$BRIDGE_DIR/venv"
 sudo -u "$REAL_USER" "$BRIDGE_DIR/venv/bin/pip" install pyserial
 
+# ── Password hash file ──
+touch /etc/zone_password.hash
+chown "$REAL_USER:$REAL_USER" /etc/zone_password.hash
+chmod 640 /etc/zone_password.hash
+
 cat > /etc/systemd/system/uart-bridge.service << SVCEOF
 [Unit]
 Description=Snapcast UART Bridge (ESP32)
