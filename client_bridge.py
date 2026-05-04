@@ -599,6 +599,19 @@ class ClientBridge:
                 ["sudo", "hostnamectl", "set-hostname", new_name],
                 timeout=5, check=True, capture_output=True
             )
+            try:
+                with open("/etc/hosts", "r") as f:
+                    lines = f.readlines()
+                with open("/etc/hosts", "w") as f:
+                    for line in lines:
+                        if "127.0.1.1" in line:
+                            f.write(f"127.0.1.1\t{new_name}\n")
+                        else:
+                            f.write(line)
+                log.info("Updated /etc/hosts with new hostname '%s'", new_name)
+            except OSError as e:
+                log.warning("Could not update /etc/hosts: %s", e)
+
             self.hostname = new_name
             if self.mode == MODE_SYNC and snapclient_is_running():
                 snapclient_stop()
