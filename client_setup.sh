@@ -61,9 +61,10 @@ apt-mark hold \
     pulseaudio pulseaudio-module-bluetooth pulseaudio-utils \
     snapclient python3-serial
 
-# Add user to bluetooth, pulse-access and dialout groups
+# Add user to bluetooth, pulse and dialout groups
 usermod -a -G bluetooth "$REAL_USER"
 usermod -a -G dialout "$REAL_USER"
+usermod -a -G pulse "$REAL_USER"
 usermod -a -G pulse-access "$REAL_USER"
 
 # ── 3. config.txt — UART, I2S, disable onboard BT ──
@@ -129,7 +130,7 @@ ctl.!default {
 }
 EOF
 
-# ── 6. Configure PulseAudio — 96kHz/32-bit ──
+# ── 6. Configure PulseAudio — user mode, 96kHz/32-bit ──
 echo ""
 echo "[6/14] Configuring PulseAudio..."
 
@@ -150,27 +151,9 @@ EOF
 sed -i '/module-loopback/d' /etc/pulse/default.pa
 sed -i '/module-switch-on-connect/d' /etc/pulse/default.pa
 
-# Configure PulseAudio client to use system socket
+# Reset client.conf to defaults (user mode, autospawn)
 cat > /etc/pulse/client.conf << 'EOF'
-default-server = unix:/run/pulse/native
-autospawn = no
-EOF
-
-# Create system-wide PulseAudio service — bridge starts/stops it per mode
-cat > /etc/systemd/system/pulseaudio-system.service << 'EOF'
-[Unit]
-Description=PulseAudio System-Wide
-After=bluetooth.service bt-init.service
-Wants=bluetooth.service
-
-[Service]
-Type=simple
-ExecStart=/usr/bin/pulseaudio --system --realtime --disallow-exit --no-cpu-limit
-Restart=always
-RestartSec=3
-
-[Install]
-WantedBy=multi-user.target
+autospawn = yes
 EOF
 
 # Disable PipeWire if installed (we use PulseAudio)
@@ -179,12 +162,12 @@ sudo -u "$REAL_USER" systemctl --user disable pipewire.service pipewire.socket \
 sudo -u "$REAL_USER" systemctl --user mask pipewire.service pipewire.socket \
     pipewire-pulse.service pipewire-pulse.socket wireplumber.service 2>/dev/null || true
 
-# Disable user PulseAudio — using system-wide instead, bridge controls it
-sudo -u "$REAL_USER" systemctl --user disable pulseaudio.service pulseaudio.socket 2>/dev/null || true
-sudo -u "$REAL_USER" systemctl --user mask pulseaudio.service pulseaudio.socket 2>/dev/null || true
+# Enable user PulseAudio
+sudo -u "$REAL_USER" systemctl --user unmask pulseaudio.service pulseaudio.socket 2>/dev/null || true
+sudo -u "$REAL_USER" systemctl --user enable pulseaudio 2>/dev/null || true
 
-# Do NOT enable pulseaudio-system at boot — bridge starts/stops it per mode
-systemctl disable pulseaudio-system 2>/dev/null || true
+# Enable linger so user services start at boot without login
+loginctl enable-linger "$REAL_USER"
 
 # ── 7. Console autologin ──
 echo ""
@@ -529,16 +512,13 @@ echo "[11/14] Configuring sudoers..."
 cat > /etc/sudoers.d/esp-bridge << SUDOEOF
 $REAL_USER ALL=(ALL) NOPASSWD: /bin/systemctl start snapclient
 $REAL_USER ALL=(ALL) NOPASSWD: /bin/systemctl stop snapclient
-$REAL_USER ALL=(ALL) NOPASSWD: /bin/systemctl start pulseaudio-system
-$REAL_USER ALL=(ALL) NOPASSWD: /bin/systemctl stop pulseaudio-system
 $REAL_USER ALL=(ALL) NOPASSWD: /usr/bin/hostnamectl set-hostname *
 SUDOEOF
 chmod 440 /etc/sudoers.d/esp-bridge
 
-# ── 12. Enable user linger ──
+# ── 12. Enable user linger (already done above, ensure it's set) ──
 echo ""
 echo "[12/14] Enabling user linger..."
-
 loginctl enable-linger "$REAL_USER"
 
 # ── 13. Avahi mDNS — IPv4 only ──
@@ -641,7 +621,7 @@ echo "========================================="
 echo " Setup complete!"
 echo ""
 echo " Services installed:"
-echo "   - pulseaudio-system (system-wide, BT mode only — bridge controls)"
+echo "   - pulseaudio (user mode, BT mode only — bridge controls)"
 echo "   - bt-init (USB dongle init)"
 echo "   - bt-agent (Python DBus auto-pair, no PIN, auto-removes on disconnect)"
 echo "   - snapclient (multiroom audio, sync mode)"
