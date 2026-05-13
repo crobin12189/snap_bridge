@@ -61,6 +61,8 @@ def pulseaudio_stop():
     try:
         subprocess.run(["sudo", "systemctl", "stop", PULSEAUDIO_SERVICE],
                        timeout=10, capture_output=True)
+        subprocess.run(["systemctl", "--user", "stop", "pulseaudio.service", "pulseaudio.socket"],
+                       timeout=10, capture_output=True)
         log.info("PulseAudio stopped")
     except Exception as e:
         log.error("pulseaudio stop: %s", e)
@@ -68,6 +70,8 @@ def pulseaudio_stop():
 def pulseaudio_start():
     try:
         subprocess.run(["sudo", "systemctl", "start", PULSEAUDIO_SERVICE],
+                       timeout=10, capture_output=True)
+        subprocess.run(["systemctl", "--user", "start", "pulseaudio.service"],
                        timeout=10, capture_output=True)
         log.info("PulseAudio started")
     except Exception as e:
@@ -877,10 +881,19 @@ class ClientBridge:
         self.client_id = None
         self.server_ip = None
         snapclient_stop()
-        time.sleep(1)              # ← give snapclient time to release ALSA
-        pulseaudio_start()         # ← start PA for BT loopback
-        time.sleep(2)              # ← give PA time to init
+        time.sleep(1)
+        pulseaudio_start()
+        time.sleep(2)
 
+        # Load loopback module after PA starts
+        try:
+            subprocess.run(
+                ["pactl", "load-module", "module-loopback", "latency_msec=200"],
+                timeout=5, capture_output=True
+            )
+            log.info("Loopback module loaded")
+        except Exception as e:
+            log.error("loopback load failed: %s", e)
 
         bt_start_discoverable()
         self.volume = pa_get_volume()
