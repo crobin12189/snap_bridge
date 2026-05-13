@@ -61,8 +61,6 @@ def pulseaudio_stop():
     try:
         subprocess.run(["sudo", "systemctl", "stop", PULSEAUDIO_SERVICE],
                        timeout=10, capture_output=True)
-        subprocess.run(["systemctl", "--user", "stop", "pulseaudio.service", "pulseaudio.socket"],
-                       timeout=10, capture_output=True)
         log.info("PulseAudio stopped")
     except Exception as e:
         log.error("pulseaudio stop: %s", e)
@@ -70,8 +68,6 @@ def pulseaudio_stop():
 def pulseaudio_start():
     try:
         subprocess.run(["sudo", "systemctl", "start", PULSEAUDIO_SERVICE],
-                       timeout=10, capture_output=True)
-        subprocess.run(["systemctl", "--user", "start", "pulseaudio.service"],
                        timeout=10, capture_output=True)
         log.info("PulseAudio started")
     except Exception as e:
