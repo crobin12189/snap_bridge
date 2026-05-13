@@ -55,6 +55,24 @@ CTRL_PORT           = 7702   # server Pi pushes mode commands here
 PW_HASH_FILE        = "/etc/zone_password.hash"
 PW_DEFAULT          = "anjay1234"
 
+PULSEAUDIO_SERVICE = "pulseaudio-system"
+
+def pulseaudio_stop():
+    try:
+        subprocess.run(["sudo", "systemctl", "stop", PULSEAUDIO_SERVICE],
+                       timeout=10, capture_output=True)
+        log.info("PulseAudio stopped")
+    except Exception as e:
+        log.error("pulseaudio stop: %s", e)
+
+def pulseaudio_start():
+    try:
+        subprocess.run(["sudo", "systemctl", "start", PULSEAUDIO_SERVICE],
+                       timeout=10, capture_output=True)
+        log.info("PulseAudio started")
+    except Exception as e:
+        log.error("pulseaudio start: %s", e)
+
 
 # ── CRC-8 ──
 def crc8(data: bytes) -> int:
@@ -819,7 +837,8 @@ class ClientBridge:
 
         bt_disconnect_all()
         bt_stop_discoverable()
-        pa_set_volume(80)
+        pulseaudio_stop()
+        time.sleep(1)
 
         if not snapclient_is_running():
             snapclient_start()
@@ -858,6 +877,10 @@ class ClientBridge:
         self.client_id = None
         self.server_ip = None
         snapclient_stop()
+        time.sleep(1)              # ← give snapclient time to release ALSA
+        pulseaudio_start()         # ← start PA for BT loopback
+        time.sleep(2)              # ← give PA time to init
+
 
         bt_start_discoverable()
         self.volume = pa_get_volume()
