@@ -55,8 +55,6 @@ CTRL_PORT           = 7702   # server Pi pushes mode commands here
 PW_HASH_FILE        = "/etc/zone_password.hash"
 PW_DEFAULT          = "anjay1234"
 
-PULSEAUDIO_SERVICE = "pulseaudio-system"
-
 def pulseaudio_stop():
     try:
         subprocess.run(["systemctl", "--user", "stop", "pulseaudio.service", "pulseaudio.socket"],
