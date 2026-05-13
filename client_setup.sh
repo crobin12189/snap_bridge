@@ -146,7 +146,7 @@ EOF
 
 # Auto-switch BT profile on connect
 grep -q "module-switch-on-connect" /etc/pulse/default.pa || \
-    echo "load-module module-switch-on-connect" >> /etc/pulse/default.pa
+    echo "load-module module-loopback latency_msec=50" >> /etc/pulse/default.pa
 
 # Disable PipeWire if installed (we use PulseAudio)
 sudo -u "$REAL_USER" systemctl --user disable pipewire.service pipewire.socket \
