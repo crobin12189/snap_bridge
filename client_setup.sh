@@ -64,7 +64,7 @@ apt-mark hold \
 usermod -a -G bluetooth "$REAL_USER"
 usermod -a -G dialout "$REAL_USER"
 
-# ── 3. config.txt — UART, I2S, disable onboard audio ──
+# ── 3. config.txt — UART, I2S, disable onboard BT ──
 echo ""
 echo "[3/14] Configuring /boot/firmware/config.txt..."
 
@@ -92,8 +92,8 @@ cat >> "$CONFIG" << 'CFGEOF'
 # Enable UART for ESP communication
 enable_uart=1
 
-# Move Bluetooth to miniuart so ttyAMA0 is free for ESP at 460800 baud
-dtoverlay=miniuart-bt
+# Disable onboard Bluetooth — using USB dongle only
+dtoverlay=disable-bt
 
 # I2S DAC
 dtoverlay=hifiberry-dac
@@ -127,7 +127,7 @@ ctl.!default {
 }
 EOF
 
-# ── 6. Configure PulseAudio — 96kHz/32-bit ──
+# ── 6. Configure PulseAudio — 96kHz/32-bit + BT loopback ──
 echo ""
 echo "[6/14] Configuring PulseAudio..."
 
@@ -144,8 +144,8 @@ default-sample-channels = 2
 resample-method = speex-float-5
 EOF
 
-# Auto-switch BT profile on connect
-grep -q "module-switch-on-connect" /etc/pulse/default.pa || \
+# Auto-loopback any BT source (phone) to default ALSA sink (I2S DAC)
+grep -q "module-loopback" /etc/pulse/default.pa || \
     echo "load-module module-loopback latency_msec=50" >> /etc/pulse/default.pa
 
 # Disable PipeWire if installed (we use PulseAudio)
@@ -164,7 +164,7 @@ echo "[7/14] Enabling console autologin..."
 
 raspi-config nonint do_boot_behaviour B2
 
-# ── 8. Bluetooth — always discoverable, auto-pair, no PIN ──
+# ── 8. Bluetooth — USB dongle, always discoverable, auto-pair, A2DP only ──
 echo ""
 echo "[8/14] Configuring Bluetooth..."
 
@@ -176,12 +176,35 @@ sed -i 's/^#*AlwaysPairable\s*=.*/AlwaysPairable = true/' /etc/bluetooth/main.co
 sed -i 's/^#*FastConnectable\s*=.*/FastConnectable = true/' /etc/bluetooth/main.conf
 sed -i 's/^#*AutoEnable\s*=.*/AutoEnable = true/' /etc/bluetooth/main.conf
 
+# Disable Headset/HFP profile — force A2DP only
+grep -q "^\[Policy\]" /etc/bluetooth/main.conf || echo "[Policy]" >> /etc/bluetooth/main.conf
+grep -q "^Disable=Headset" /etc/bluetooth/main.conf || \
+    sed -i '/^\[Policy\]/a Disable=Headset' /etc/bluetooth/main.conf
+
+# USB dongle init service — bring hci0 up after bluetooth service
+cat > /etc/systemd/system/bt-init.service << 'EOF'
+[Unit]
+Description=Bluetooth USB dongle init
+After=bluetooth.service
+Requires=bluetooth.service
+
+[Service]
+Type=oneshot
+ExecStartPre=/bin/sleep 2
+ExecStart=/usr/sbin/rfkill unblock bluetooth
+ExecStart=/usr/bin/hciconfig hci0 up
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
 # Always-discoverable service
 cat > /etc/systemd/system/bt-discoverable.service << 'EOF'
 [Unit]
 Description=Bluetooth Always Discoverable
-After=bluetooth.service
-Requires=bluetooth.service
+After=bluetooth.service bt-init.service
+Requires=bluetooth.service bt-init.service
 
 [Service]
 Type=oneshot
@@ -196,7 +219,7 @@ EOF
 cat > /etc/systemd/system/bt-agent.service << 'EOF'
 [Unit]
 Description=Bluetooth Auth Agent
-After=bluetooth.service
+After=bluetooth.service bt-init.service
 PartOf=bluetooth.service
 
 [Service]
@@ -210,6 +233,7 @@ WantedBy=bluetooth.target
 EOF
 
 systemctl daemon-reload
+systemctl enable bt-init.service
 systemctl enable bt-discoverable.service
 systemctl enable bt-agent.service
 
@@ -236,7 +260,6 @@ wget -O "$BRIDGE_DIR/client_bridge.py" \
     "https://raw.githubusercontent.com/crobin12189/snap_bridge/main/client_bridge.py"
 
 chmod +x "$BRIDGE_DIR/client_bridge.py"
-
 
 # ── Password hash file ──
 touch /etc/zone_password.hash
@@ -275,6 +298,7 @@ $REAL_USER ALL=(ALL) NOPASSWD: /bin/systemctl stop snapclient
 $REAL_USER ALL=(ALL) NOPASSWD: /usr/bin/hostnamectl set-hostname *
 SUDOEOF
 chmod 440 /etc/sudoers.d/esp-bridge
+
 # ── 12. Enable user linger ──
 echo ""
 echo "[12/14] Enabling user linger..."
@@ -297,7 +321,6 @@ fi
 echo ""
 echo "[14/14] Installing sigmadsp backend..."
 
-
 # Clone fork and run install.sh
 sudo -u "$REAL_USER" git clone https://github.com/crobin12189/sigmadsp.git "$REAL_HOME/sigmadsp" || true
 cd "$REAL_HOME/sigmadsp"
@@ -306,7 +329,6 @@ set +e
 set -e
 
 # Fix gpiozero FIRST before creating service — 1.6.2 has pkg_resources bug, 2.0.1 works fine
-# despite version constraint warning from pipx
 echo "Upgrading gpiozero to 2.0.1..."
 VENV_PIP="$REAL_HOME/.local/pipx/venvs/sigmadsp/bin/python"
 sudo -u "$REAL_USER" $VENV_PIP -m pip install "gpiozero==2.0.1" --force-reinstall
@@ -387,7 +409,8 @@ echo "========================================="
 echo " Setup complete!"
 echo ""
 echo " Services installed:"
-echo "   - pulseaudio (audio + BT A2DP sink)"
+echo "   - pulseaudio (audio + BT A2DP receiver)"
+echo "   - bt-init (USB dongle init)"
 echo "   - bt-discoverable (always discoverable)"
 echo "   - bt-agent (auto-pair, no PIN)"
 echo "   - snapclient (multiroom audio)"
@@ -402,7 +425,7 @@ echo "   /etc/bluetooth/main.conf"
 echo "   /etc/default/snapclient"
 echo "   /etc/avahi/avahi-daemon.conf"
 echo "   /var/lib/sigmadsp/config.yaml"
-echo "   /etc/zone_password.hash (password hash, seeded on first bridge run)"
+echo "   /etc/zone_password.hash"
 echo ""
 echo " Bridge script: $BRIDGE_DIR/client_bridge.py"
 echo " SigmaDSP repo: $REAL_HOME/sigmadsp"
