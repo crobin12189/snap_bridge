@@ -39,10 +39,12 @@ CLIENT_ID_LEN     = 36
 CLIENT_NAME_LEN   = 32
 CLIENT_ENTRY_SIZE = CLIENT_ID_LEN + CLIENT_NAME_LEN + 6
 
-CTRL_PORT         = 7702
-PW_HASH_FILE      = "/etc/zone_password.hash"
-PW_DEFAULT        = "anjay1234"
-PW_BROADCAST_PORT = 7700
+CTRL_PORT            = 7702
+DISCOVERY_PORT       = 7703
+DISCOVERY_INTERVAL_S = 10
+PW_HASH_FILE         = "/etc/zone_password.hash"
+PW_DEFAULT           = "anjay1234"
+PW_BROADCAST_PORT    = 7700
 
 logging.basicConfig(
     level=logging.INFO,
@@ -70,7 +72,6 @@ def build_frame(msg_type: int, payload: bytes = b"") -> bytes:
 
 
 # ── Hash pull server — port 7701 ──
-# Client Pi connects here on first sync to fetch current password hash
 class HashPullServer(threading.Thread):
     def __init__(self, get_hash_fn):
         super().__init__(daemon=True)
@@ -127,7 +128,16 @@ class SnapcastClient:
         while time.time() < deadline:
             ready, _, _ = select.select([self.sock], [], [], 0.5)
             if ready:
-                data = self.sock.recv(4096)
+                # ── Race condition fix: re-check sock is still valid ──
+                if not self.sock:
+                    return {}
+                try:
+                    data = self.sock.recv(4096)
+                except OSError as e:
+                    log.error("RPC recv failed: %s", e)
+                    self.sock = None
+                    self._recv_buf = b""
+                    return {}
                 if not data:
                     raise ConnectionError("Snapcast closed")
                 self._recv_buf += data
@@ -161,6 +171,8 @@ class SnapcastClient:
         try:
             ready, _, _ = select.select([self.sock], [], [], 0)
             if ready:
+                if not self.sock:
+                    return notifications
                 data = self.sock.recv(4096)
                 if not data:
                     raise ConnectionError("Snapcast closed")
@@ -235,7 +247,7 @@ class UARTReceiver:
                 self.state = self.SYNC_0_ST
 
 
-# ── Per-client state tracked on server Pi ──
+# ── Per-client state ──
 class ClientRecord:
     def __init__(self, snap_id: str, name: str):
         self.snap_id        = snap_id
@@ -381,6 +393,12 @@ class ServerBridge:
         self._clients: dict[str, ClientRecord] = {}
         self._clients_lock = threading.Lock()
 
+        # name -> ip for discovery before Snapcast knows about client
+        self._clients_by_name: dict[str, str] = {}
+
+        # Track known snap_ids to detect additions/removals
+        self._known_snap_ids: set[str] = set()
+
         self._esp_connected        = False
         self._last_esp_msg_time    = time.time()
         self._last_snap_health     = time.time()
@@ -390,9 +408,65 @@ class ServerBridge:
 
         self._pw_hash, self._pw_user_set = load_or_init_password()
 
-        # Start hash pull server on port 7701
         self._hash_pull_server = HashPullServer(lambda: self._pw_hash)
         self._hash_pull_server.start()
+
+    # ────────────────────────────────────────────
+    # UDP discovery broadcaster — port 7703
+    # ────────────────────────────────────────────
+    def _discovery_thread(self):
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        sock.settimeout(1.0)
+        log.info("UDP discovery broadcaster started")
+
+        discover_msg = json.dumps({"type": "discover"}).encode()
+
+        while True:
+            try:
+                sock.sendto(discover_msg, ("255.255.255.255", DISCOVERY_PORT))
+                log.debug("Discovery broadcast sent")
+            except Exception as e:
+                log.warning("Discovery broadcast error: %s", e)
+
+            deadline = time.time() + DISCOVERY_INTERVAL_S
+            while time.time() < deadline:
+                try:
+                    data, addr = sock.recvfrom(512)
+                    try:
+                        msg = json.loads(data.decode())
+                    except Exception:
+                        continue
+                    if msg.get("type") == "announce":
+                        ip   = msg.get("ip", addr[0])
+                        name = msg.get("name", "")
+                        log.info("Discovery: %s at %s", name, ip)
+                        self._on_client_discovered(name, ip)
+                except socket.timeout:
+                    continue
+                except Exception as e:
+                    log.error("Discovery recv error: %s", e)
+
+    def _on_client_discovered(self, name: str, ip: str):
+        with self._clients_lock:
+            matched = None
+            for rec in self._clients.values():
+                if rec.name.lower() == name.lower():
+                    matched = rec
+                    break
+
+            if matched:
+                if matched.client_ip != ip:
+                    log.info("Updated IP for %s: %s -> %s",
+                             name, matched.client_ip, ip)
+                    matched.client_ip = ip
+            else:
+                self._clients_by_name[name] = ip
+                log.info("Discovery: unknown client %s at %s — cached", name, ip)
+                return
+
+        matched.ensure_connected(self._on_ctrl_message)
 
     # ────────────────────────────────────────────
     # UART helpers
@@ -436,11 +510,13 @@ class ServerBridge:
 
     # ────────────────────────────────────────────
     # Snapcast status → update ClientRecord map
+    # Returns True if client SET changed (addition/removal)
     # ────────────────────────────────────────────
-    def _update_from_snap_status(self, status: dict):
+    def _update_from_snap_status(self, status: dict) -> bool:
+        set_changed = False
+
         with self._clients_lock:
-            for rec in self._clients.values():
-                rec.snap_connected = False
+            seen_ids = set()
 
             for group in status.get("server", {}).get("groups", []):
                 for c in group.get("clients", []):
@@ -457,19 +533,41 @@ class ServerBridge:
                     connected = c.get("connected", False)
                     ip        = host.get("ip", "")
 
-                    if snap_id not in self._clients:
-                        self._clients[snap_id] = ClientRecord(snap_id, name)
-                        log.info("New client discovered: %s (%s)", name, snap_id)
+                    seen_ids.add(snap_id)
 
-                    rec = self._clients[snap_id]
+                    if snap_id not in self._clients:
+                        # Brand new client — set changed
+                        rec = ClientRecord(snap_id, name)
+                        self._clients[snap_id] = rec
+                        self._known_snap_ids.add(snap_id)
+                        set_changed = True
+                        log.info("New client: %s (%s)", name, snap_id)
+
+                        # Match cached discovery IP
+                        cached_ip = self._clients_by_name.pop(name, None)
+                        if cached_ip:
+                            rec.client_ip = cached_ip
+                        elif ip:
+                            rec.client_ip = ip
+                    else:
+                        rec = self._clients[snap_id]
+
                     rec.name           = name
                     rec.muted          = muted
                     rec.snap_connected = connected
-                    if ip:
+                    if ip and not rec.client_ip:
                         rec.client_ip = ip
-                    # Only update volume from Snapcast if client is in sync mode
                     if rec.mode == MODE_SYNC:
                         rec.volume = volume
+
+            # Check for removed clients (seen before but not in this status)
+            # We never delete records — just mark disconnected
+            # But if a snap_id that was in _known_snap_ids disappears entirely
+            # from Snapcast (not just disconnected), that's a removal
+            # For now: keep all records, don't treat disappearance as removal
+            # since Snapcast sometimes temporarily drops clients
+
+        return set_changed
 
     # ────────────────────────────────────────────
     # Client Pi control message handler
@@ -491,6 +589,7 @@ class ServerBridge:
                      rec.name, rec.mode, rec.snap_connected,
                      rec.bt_connected, rec.volume)
 
+            # Forward state update to server ESP — does NOT rebuild UI
             if self._esp_connected:
                 id_bytes = rec.snap_id.encode("ascii")[:CLIENT_ID_LEN]
                 id_bytes = id_bytes.ljust(CLIENT_ID_LEN, b"\x00")
@@ -513,7 +612,7 @@ class ServerBridge:
             pass
 
     # ────────────────────────────────────────────
-    # Ensure connections to all known client Pi's
+    # Ensure control connections
     # ────────────────────────────────────────────
     def _ensure_ctrl_connections(self):
         with self._clients_lock:
@@ -537,6 +636,7 @@ class ServerBridge:
                 self._update_from_snap_status(status)
             except Exception as e:
                 log.error("Snap status on INIT failed: %s", e)
+            # Always send full list on INIT
             self._send_client_list()
             self.send_frame(MSG_PW_ACK, bytes([1 if self._pw_user_set else 0]))
 
@@ -635,12 +735,17 @@ class ServerBridge:
                 id_bytes = snap_id.encode("ascii")[:CLIENT_ID_LEN]
                 id_bytes = id_bytes.ljust(CLIENT_ID_LEN, b"\x00")
                 self.send_frame(MSG_CLIENT_VOL_UPD, id_bytes + bytes([volume]))
+
         else:
+            # Connect/disconnect/rename — refresh status
+            # Only send CLIENT_LIST if set actually changed
             time.sleep(0.5)
             try:
                 status = self.snap.get_status()
-                self._update_from_snap_status(status)
-                self._send_client_list()
+                set_changed = self._update_from_snap_status(status)
+                if set_changed and self._esp_connected:
+                    self._send_client_list()
+                    log.info("Client set changed — sent CLIENT_LIST")
             except Exception as e:
                 log.error("Snap refresh failed: %s", e)
 
@@ -649,8 +754,6 @@ class ServerBridge:
     # ────────────────────────────────────────────
     def _snap_reconnect(self):
         log.error("Snapcast lost")
-        if self._esp_connected:
-            self._send_client_list()
         try:
             if self.snap.sock:
                 self.snap.sock.close()
@@ -667,8 +770,9 @@ class ServerBridge:
         self.snap.connect()
         try:
             status = self.snap.get_status()
-            self._update_from_snap_status(status)
+            set_changed = self._update_from_snap_status(status)
             if self._esp_connected:
+                # Always resend after reconnect
                 self._send_client_list()
         except Exception as e:
             log.error("Snap reconnect status failed: %s", e)
@@ -679,6 +783,8 @@ class ServerBridge:
     def run(self):
         log.info("Server bridge starting — %s @ %d", self.ser.port, self.ser.baudrate)
         self.snap.connect()
+
+        threading.Thread(target=self._discovery_thread, daemon=True).start()
 
         while self._running:
             data = self.ser.read(256)
@@ -697,8 +803,11 @@ class ServerBridge:
                     self._last_snap_health = now
                     try:
                         status = self.snap.get_status()
-                        self._update_from_snap_status(status)
-                        self._send_client_list()
+                        set_changed = self._update_from_snap_status(status)
+                        # Only resend CLIENT_LIST if set changed
+                        if set_changed:
+                            self._send_client_list()
+                            log.info("Client set changed — sent CLIENT_LIST")
                     except (ConnectionError, OSError, TimeoutError):
                         self._snap_reconnect()
                     except Exception as e:
