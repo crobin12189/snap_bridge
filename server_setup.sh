@@ -167,12 +167,12 @@ SVCEOF
 echo ""
 echo "[7/9] Setting up UART bridge..."
 
-BRIDGE_DIR="$REAL_HOME/uart-bridge"
+BRIDGE_DIR="$REAL_HOME/server_bridge"
 mkdir -p "$BRIDGE_DIR"
 
 # Download bridge script from GitHub
-wget -O "$BRIDGE_DIR/snapcast_bridge.py" \
-    "https://raw.githubusercontent.com/crobin12189/snap_bridge/main/snapcast_bridge.py"
+wget -O "$BRIDGE_DIR/server_bridge.py" \
+    "https://raw.githubusercontent.com/crobin12189/snap_bridge/main/server_bridge.py"
 
 chown -R "$REAL_USER:$REAL_USER" "$BRIDGE_DIR"
 
@@ -185,7 +185,7 @@ touch /etc/zone_password.hash
 chown "$REAL_USER:$REAL_USER" /etc/zone_password.hash
 chmod 640 /etc/zone_password.hash
 
-cat > /etc/systemd/system/uart-bridge.service << SVCEOF
+cat > /etc/systemd/system/server_bridge.service << SVCEOF
 [Unit]
 Description=Snapcast UART Bridge (ESP32)
 After=snapserver.service
@@ -194,7 +194,7 @@ Wants=snapserver.service
 [Service]
 Type=simple
 User=$REAL_USER
-ExecStart=$BRIDGE_DIR/venv/bin/python3 $BRIDGE_DIR/snapcast_bridge.py --port /dev/ttyAMA0 --baud 460800
+ExecStart=$BRIDGE_DIR/venv/bin/python3 $BRIDGE_DIR/server_bridge.py --port /dev/ttyAMA0 --baud 460800
 Restart=always
 RestartSec=3
 
@@ -223,7 +223,7 @@ echo "[9/9] Enabling services..."
 systemctl daemon-reload
 systemctl enable snapserver
 systemctl enable snapcast-source
-systemctl enable uart-bridge
+systemctl enable server_bridge
 
 cat > /etc/sysctl.d/99-tcp-retries.conf << 'EOF'
 net.ipv4.tcp_retries2 = 3
@@ -240,10 +240,10 @@ echo ""
 echo " Services installed:"
 echo "   - snapserver (audio streaming)"
 echo "   - snapcast-source (USB audio capture)"
-echo "   - uart-bridge (ESP32 communication)"
+echo "   - server_bridge (ESP32 communication)"
 echo ""
 echo " UART bridge script location:"
-echo "   $BRIDGE_DIR/snapcast_bridge.py"
+echo "   $BRIDGE_DIR/server_bridge.py"
 echo ""
 echo " Config files:"
 echo "   /etc/snapserver.conf"
