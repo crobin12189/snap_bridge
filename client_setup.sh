@@ -151,11 +151,6 @@ EOF
 sed -i '/module-loopback/d' /etc/pulse/default.pa
 sed -i '/module-switch-on-connect/d' /etc/pulse/default.pa
 
-# Reset client.conf to defaults (user mode, autospawn)
-cat > /etc/pulse/client.conf << 'EOF'
-autospawn = yes
-EOF
-
 # Disable PipeWire if installed (we use PulseAudio)
 sudo -u "$REAL_USER" systemctl --user disable pipewire.service pipewire.socket \
     pipewire-pulse.service pipewire-pulse.socket wireplumber.service 2>/dev/null || true
