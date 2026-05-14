@@ -51,9 +51,11 @@ ACK_PAYLOAD_SIZE  = 33
 SNAPCLIENT_SERVICE  = "snapclient"
 SNAP_RPC_PORT       = 1705
 PW_BROADCAST_PORT   = 7700
-CTRL_PORT           = 7702   # server Pi pushes mode commands here
+CTRL_PORT           = 7702
+DISCOVERY_PORT      = 7703   # UDP — server Pi discovers client Pi's IP
 PW_HASH_FILE        = "/etc/zone_password.hash"
 PW_DEFAULT          = "anjay1234"
+
 
 def pulseaudio_stop():
     try:
@@ -62,6 +64,7 @@ def pulseaudio_stop():
         log.info("PulseAudio stopped")
     except Exception as e:
         log.error("pulseaudio stop: %s", e)
+
 
 def pulseaudio_start():
     try:
@@ -134,6 +137,18 @@ def fetch_hash_from_server(server_ip: str) -> Optional[str]:
     except OSError as e:
         log.warning("Hash pull failed: %s", e)
         return None
+
+
+def get_own_ip() -> str:
+    """Get our own IP address by connecting a UDP socket (no data sent)."""
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except Exception:
+        return "127.0.0.1"
 
 
 # ── UART frame receiver ──
@@ -484,8 +499,6 @@ def snapclient_is_running() -> bool:
 
 # ── Password broadcast listener — port 7700 ──
 class PasswordListener(threading.Thread):
-    """Listens on TCP port 7700 for hash broadcasts from server Pi."""
-
     def __init__(self, on_hash_received):
         super().__init__(daemon=True)
         self._cb = on_hash_received
@@ -590,8 +603,35 @@ class ClientBridge:
         self.send_frame(MSG_STATE_UPDATE, payload)
 
     # ────────────────────────────────────────────
+    # UDP discovery listener — port 7703
+    # Server Pi sends {"type":"discover"} broadcast
+    # We reply with {"type":"announce","ip":"...","name":"..."}
+    # ────────────────────────────────────────────
+    def _discovery_thread(self):
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind(("0.0.0.0", DISCOVERY_PORT))
+        log.info("UDP discovery listener on port %d", DISCOVERY_PORT)
+        while True:
+            try:
+                data, addr = sock.recvfrom(512)
+                try:
+                    msg = json.loads(data.decode())
+                except Exception:
+                    continue
+                if msg.get("type") == "discover":
+                    reply = json.dumps({
+                        "type": "announce",
+                        "ip":   get_own_ip(),
+                        "name": self.hostname,
+                    }).encode()
+                    sock.sendto(reply, addr)
+                    log.info("Discovery reply sent to %s", addr[0])
+            except Exception as e:
+                log.error("Discovery listener error: %s", e)
+
+    # ────────────────────────────────────────────
     # Control socket — port 7702
-    # Server Pi connects here to push mode commands
     # ────────────────────────────────────────────
     def _ctrl_server_thread(self):
         srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -616,7 +656,6 @@ class ClientBridge:
     def _ctrl_client_handler(self, conn: socket.socket, addr):
         buf = b""
         try:
-            # Send current state immediately on connect
             self._send_ctrl_state(conn)
             conn.settimeout(60)
             while True:
@@ -672,7 +711,6 @@ class ClientBridge:
             log.warning("Failed to send ctrl state: %s", e)
 
     def broadcast_ctrl_state(self):
-        """Push current state to all connected server Pi control sockets."""
         with self._ctrl_lock:
             dead = []
             for conn in self._ctrl_clients:
@@ -689,18 +727,16 @@ class ClientBridge:
         if mtype == "set_mode":
             new_mode = msg.get("mode", MODE_SYNC)
             log.info("Control: set_mode -> %d", new_mode)
-            # Notify server Pi switching has started
             try:
                 self._send_ctrl_msg(conn, {"type": "switching"})
             except Exception:
                 pass
-            # Run switch in thread so we don't block the control socket
             threading.Thread(
                 target=self._do_mode_switch,
                 args=(new_mode,),
                 daemon=True,
             ).start()
-        
+
         elif mtype == "set_volume":
             vol = msg.get("volume", self.volume)
             self.volume = vol
@@ -879,7 +915,6 @@ class ClientBridge:
         pulseaudio_start()
         time.sleep(2)
 
-        # Load loopback module after PA starts
         try:
             subprocess.run(
                 ["pactl", "load-module", "module-loopback", "latency_msec=200"],
@@ -1019,7 +1054,7 @@ class ClientBridge:
         log.info("Client bridge — %s @ %d — hostname: %s",
                  self.ser.port, self.ser.baudrate, self.hostname)
 
-        # Start control socket server
+        threading.Thread(target=self._discovery_thread,  daemon=True).start()
         threading.Thread(target=self._ctrl_server_thread, daemon=True).start()
 
         self.enter_sync_mode()
