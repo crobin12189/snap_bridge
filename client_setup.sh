@@ -137,6 +137,9 @@ echo "[6/14] Configuring PulseAudio..."
 # Remove any existing custom config to avoid duplicates
 sed -i '/^# Client audio config$/,/^resample-method/d' /etc/pulse/daemon.conf
 
+# Disable autospawn — bridge controls PA start/stop
+echo "autospawn = no" >> /etc/pulse/client.conf
+
 cat >> /etc/pulse/daemon.conf << 'EOF'
 
 # Client audio config
@@ -366,10 +369,7 @@ def on_properties_changed(interface, changed, invalidated, path, bus):
         if changed["Connected"]:
             log.info("Device connected: %s", path)
         else:
-            log.info("Device disconnected: %s — removing bonding", path)
-            threading.Thread(
-                target=remove_device, args=(bus, path), daemon=True
-            ).start()
+            log.info("Device disconnected: %s", path)
 
 
 def watchdog(bus):
