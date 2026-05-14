@@ -38,12 +38,12 @@ fi
 
 # ── 1. Update package lists ──
 echo ""
-echo "[1/14] Updating package lists..."
+echo "[1/13] Updating package lists..."
 apt update
 
 # ── 2. Install packages (pinned versions) ──
 echo ""
-echo "[2/14] Installing packages..."
+echo "[2/13] Installing packages..."
 apt install -y \
     pulseaudio=16.1+dfsg1-2+rpt1.1 \
     pulseaudio-module-bluetooth=16.1+dfsg1-2+rpt1.1 \
@@ -69,7 +69,7 @@ usermod -a -G pulse-access "$REAL_USER"
 
 # ── 3. config.txt — UART, I2S, disable onboard BT ──
 echo ""
-echo "[3/14] Configuring /boot/firmware/config.txt..."
+echo "[3/13] Configuring /boot/firmware/config.txt..."
 
 CONFIG="/boot/firmware/config.txt"
 cp "$CONFIG" "${CONFIG}.bak"
@@ -104,14 +104,14 @@ CFGEOF
 
 # ── 4. Free UART from serial console ──
 echo ""
-echo "[4/14] Freeing UART from serial console..."
+echo "[4/13] Freeing UART from serial console..."
 
 sed -i 's/console=serial0,[0-9]* //' /boot/firmware/cmdline.txt
 systemctl disable serial-getty@ttyAMA0.service 2>/dev/null || true
 
 # ── 5. ALSA config — 96kHz/32-bit ──
 echo ""
-echo "[5/14] Configuring ALSA (96kHz/32-bit)..."
+echo "[5/13] Configuring ALSA (96kHz/32-bit)..."
 
 cat > /etc/asound.conf << 'EOF'
 pcm.!default {
@@ -132,7 +132,7 @@ EOF
 
 # ── 6. Configure PulseAudio — user mode, 96kHz/32-bit ──
 echo ""
-echo "[6/14] Configuring PulseAudio..."
+echo "[6/13] Configuring PulseAudio..."
 
 # Remove any existing custom config to avoid duplicates
 sed -i '/^# Client audio config$/,/^resample-method/d' /etc/pulse/daemon.conf
@@ -169,13 +169,13 @@ loginctl enable-linger "$REAL_USER"
 
 # ── 7. Console autologin ──
 echo ""
-echo "[7/14] Enabling console autologin..."
+echo "[7/13] Enabling console autologin..."
 
 raspi-config nonint do_boot_behaviour B2
 
 # ── 8. Bluetooth — USB dongle, always discoverable, auto-pair, A2DP ──
 echo ""
-echo "[8/14] Configuring Bluetooth..."
+echo "[8/13] Configuring Bluetooth..."
 
 # BlueZ main.conf
 sed -i 's/^#*Class\s*=.*/Class = 0x41C/' /etc/bluetooth/main.conf
@@ -451,7 +451,7 @@ systemctl enable bt-agent.service
 
 # ── 9. Snapclient — 96kHz/32-bit ALSA ──
 echo ""
-echo "[9/14] Configuring Snapclient..."
+echo "[9/13] Configuring Snapclient..."
 
 cat > /etc/default/snapclient << 'EOF'
 START_SNAPCLIENT=true
@@ -462,7 +462,7 @@ systemctl enable snapclient
 
 # ── 10. ESP Bridge ──
 echo ""
-echo "[10/14] Setting up ESP Bridge..."
+echo "[10/13] Setting up ESP Bridge..."
 
 BRIDGE_DIR="/opt/esp-bridge"
 mkdir -p "$BRIDGE_DIR"
@@ -502,7 +502,7 @@ systemctl enable esp-bridge.service
 
 # ── 11. Sudo permissions ──
 echo ""
-echo "[11/14] Configuring sudoers..."
+echo "[11/13] Configuring sudoers..."
 
 cat > /etc/sudoers.d/esp-bridge << SUDOEOF
 $REAL_USER ALL=(ALL) NOPASSWD: /bin/systemctl start snapclient
@@ -513,12 +513,12 @@ chmod 440 /etc/sudoers.d/esp-bridge
 
 # ── 12. Enable user linger (already done above, ensure it's set) ──
 echo ""
-echo "[12/14] Enabling user linger..."
+echo "[12/13] Enabling user linger..."
 loginctl enable-linger "$REAL_USER"
 
 # ── 13. Avahi mDNS — IPv4 only ──
 echo ""
-echo "[13/14] Configuring Avahi for IPv4 only..."
+echo "[13/13] Configuring Avahi for IPv4 only..."
 
 if grep -q "^use-ipv6" /etc/avahi/avahi-daemon.conf; then
     sed -i 's/^#*use-ipv6\s*=.*/use-ipv6=no/' /etc/avahi/avahi-daemon.conf
@@ -527,71 +527,6 @@ elif grep -q "^#.*use-ipv6" /etc/avahi/avahi-daemon.conf; then
 else
     sed -i '/^\[server\]/a use-ipv6=no' /etc/avahi/avahi-daemon.conf
 fi
-
-# ── 14. SigmaDSP Backend (ADAU1466 over SPI) ──
-echo ""
-echo "[14/14] Installing sigmadsp backend..."
-
-sudo -u "$REAL_USER" git clone https://github.com/crobin12189/sigmadsp.git "$REAL_HOME/sigmadsp" || true
-cd "$REAL_HOME/sigmadsp"
-set +e
-(sudo -u "$REAL_USER" bash install.sh <<< "n")
-set -e
-
-echo "Upgrading gpiozero to 2.0.1..."
-VENV_PIP="$REAL_HOME/.local/pipx/venvs/sigmadsp/bin/python"
-sudo -u "$REAL_USER" $VENV_PIP -m pip install "gpiozero==2.0.1" --force-reinstall
-
-SIGMADSP_BIN="$REAL_HOME/.local/bin/sigmadsp-backend"
-
-cat > /etc/systemd/system/sigmadsp-backend.service << SIGEOF
-[Unit]
-Description=sigmadsp backend service
-After=network.target
-
-[Service]
-ExecStart=$SIGMADSP_BIN --settings /var/lib/sigmadsp/config.yaml
-Restart=always
-RestartSec=5
-User=$REAL_USER
-
-[Install]
-WantedBy=multi-user.target
-SIGEOF
-
-mkdir -p /var/lib/sigmadsp
-cat > /var/lib/sigmadsp/config.yaml << 'YAMLEOF'
-host:
-  ip: "0.0.0.0"
-  port: 8087
-
-backend:
-  port: 50051
-
-parameters:
-  path: "/var/lib/sigmadsp/current.params"
-
-dsp:
-  type: "adau14xx"
-  protocol: "spi"
-  bus_number: "0"
-  device_address: "0"
-  pins:
-    reset:
-      number: 25
-      active_high: false
-      initial_state: true
-      mode: "output"
-    self_boot:
-      number: 22
-      active_high: true
-      initial_state: false
-      mode: "output"
-YAMLEOF
-
-systemctl daemon-reload
-systemctl enable sigmadsp-backend
-systemctl start sigmadsp-backend
 
 # ── Static IP for eth0 ──
 echo ""
@@ -621,7 +556,6 @@ echo "   - bt-init (USB dongle init)"
 echo "   - bt-agent (Python DBus auto-pair, no PIN, auto-removes on disconnect)"
 echo "   - snapclient (multiroom audio, sync mode)"
 echo "   - esp-bridge (ESP32 UART communication)"
-echo "   - sigmadsp-backend (ADAU1466 SPI control, port 8087)"
 echo ""
 echo " Key behaviors:"
 echo "   - Sync mode: PulseAudio OFF, snapclient ON (ALSA direct at 96kHz)"
@@ -635,22 +569,15 @@ echo "   /etc/pulse/client.conf"
 echo "   /etc/bluetooth/main.conf"
 echo "   /etc/default/snapclient"
 echo "   /etc/avahi/avahi-daemon.conf"
-echo "   /var/lib/sigmadsp/config.yaml"
 echo "   /etc/zone_password.hash"
 echo ""
 echo " Bridge scripts: $BRIDGE_DIR/"
-echo " SigmaDSP repo:  $REAL_HOME/sigmadsp"
 echo ""
 echo " Wiring:"
 echo "   GPIO14 (TX) → ESP RX"
 echo "   GPIO15 (RX) → ESP TX"
 echo "   I2S: GPIO18 (BCLK), GPIO19 (LRCLK), GPIO21 (DOUT)"
 echo "   DAC SD_MODE → 3.3V"
-echo "   SPI0: GPIO10 (MOSI), GPIO9 (MISO), GPIO11 (SCLK), GPIO8 (CE0)"
-echo "   ADAU1466 RES → GPIO25"
-echo "   ADAU1466 5V → Pi Pin 2/4, GND → Pi GND"
-echo ""
-echo " SigmaStudio: connect to this Pi's IP on port 8087"
 echo ""
 echo " Network:"
 echo "   eth0 static IP: $STATIC_IP/$SUBNET"
