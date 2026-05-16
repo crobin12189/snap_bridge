@@ -1077,7 +1077,6 @@ class ClientBridge:
                 if self.mode == MODE_SYNC:
                     self.ensure_rpc()
                     self.handle_snap_notifications()
-
                     if now - last_heavy_poll >= 10.0:
                         last_heavy_poll = now
                         if self.rpc.connected and self.client_id:
@@ -1094,10 +1093,13 @@ class ClientBridge:
                                 self._last_rpc_attempt = 0.0
                                 self.send_state(force=True)
                                 self.broadcast_ctrl_state()
-                else:
-                    if now - self._last_poll_time >= self.POLL_INTERVAL_S:
-                        self._last_poll_time = now
-                        self.poll_bt()
+
+            # BT polling runs regardless of ESP connection
+            if self.mode == MODE_BT:
+                now = time.time()
+                if now - self._last_poll_time >= self.POLL_INTERVAL_S:
+                    self._last_poll_time = now
+                    self.poll_bt()
 
 
 def main():
