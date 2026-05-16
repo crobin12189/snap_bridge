@@ -38,12 +38,12 @@ fi
 
 # ── 1. Update package lists ──
 echo ""
-echo "[1/13] Updating package lists..."
+echo "[1/12] Updating package lists..."
 apt update
 
 # ── 2. Install packages (pinned versions) ──
 echo ""
-echo "[2/13] Installing packages..."
+echo "[2/12] Installing packages..."
 apt install -y \
     pulseaudio=16.1+dfsg1-2+rpt1.1 \
     pulseaudio-module-bluetooth=16.1+dfsg1-2+rpt1.1 \
@@ -69,7 +69,7 @@ usermod -a -G pulse-access "$REAL_USER"
 
 # ── 3. config.txt — UART, I2S, disable onboard BT ──
 echo ""
-echo "[3/13] Configuring /boot/firmware/config.txt..."
+echo "[3/12] Configuring /boot/firmware/config.txt..."
 
 CONFIG="/boot/firmware/config.txt"
 cp "$CONFIG" "${CONFIG}.bak"
@@ -104,35 +104,15 @@ CFGEOF
 
 # ── 4. Free UART from serial console ──
 echo ""
-echo "[4/13] Freeing UART from serial console..."
+echo "[4/12] Freeing UART from serial console..."
 
 sed -i 's/console=serial0,[0-9]* //' /boot/firmware/cmdline.txt
 systemctl disable serial-getty@ttyAMA0.service 2>/dev/null || true
 
-# ── 5. ALSA config — 96kHz/32-bit ──
+
+# ── 5. Configure PulseAudio — user mode, 96kHz/32-bit ──
 echo ""
-echo "[5/13] Configuring ALSA (96kHz/32-bit)..."
-
-cat > /etc/asound.conf << 'EOF'
-pcm.!default {
-    type plug
-    slave {
-        pcm "hw:0,0"
-        format S32_LE
-        rate 96000
-        channels 2
-    }
-}
-
-ctl.!default {
-    type hw
-    card 0
-}
-EOF
-
-# ── 6. Configure PulseAudio — user mode, 96kHz/32-bit ──
-echo ""
-echo "[6/13] Configuring PulseAudio..."
+echo "[5/12] Configuring PulseAudio..."
 
 # Remove any existing custom config to avoid duplicates
 sed -i '/^# Client audio config$/,/^resample-method/d' /etc/pulse/daemon.conf
@@ -167,15 +147,15 @@ sudo -u "$REAL_USER" systemctl --user enable pulseaudio 2>/dev/null || true
 # Enable linger so user services start at boot without login
 loginctl enable-linger "$REAL_USER"
 
-# ── 7. Console autologin ──
+# ── 6. Console autologin ──
 echo ""
-echo "[7/13] Enabling console autologin..."
+echo "[6/12] Enabling console autologin..."
 
 raspi-config nonint do_boot_behaviour B2
 
-# ── 8. Bluetooth — USB dongle, always discoverable, auto-pair, A2DP ──
+# ── 7. Bluetooth — USB dongle, always discoverable, auto-pair, A2DP ──
 echo ""
-echo "[8/13] Configuring Bluetooth..."
+echo "[7/12] Configuring Bluetooth..."
 
 # BlueZ main.conf
 sed -i 's/^#*Class\s*=.*/Class = 0x41C/' /etc/bluetooth/main.conf
@@ -449,9 +429,9 @@ systemctl daemon-reload
 systemctl enable bt-init.service
 systemctl enable bt-agent.service
 
-# ── 9. Snapclient — 96kHz/32-bit ALSA ──
+# ── 8. Snapclient — 96kHz/32-bit ALSA ──
 echo ""
-echo "[9/13] Configuring Snapclient..."
+echo "[8/12] Configuring Snapclient..."
 
 cat > /etc/default/snapclient << 'EOF'
 START_SNAPCLIENT=true
@@ -460,9 +440,9 @@ EOF
 
 systemctl enable snapclient
 
-# ── 10. ESP Bridge ──
+# ── 9. ESP Bridge ──
 echo ""
-echo "[10/13] Setting up ESP Bridge..."
+echo "[9/12] Setting up ESP Bridge..."
 
 BRIDGE_DIR="/opt/esp-bridge"
 mkdir -p "$BRIDGE_DIR"
@@ -500,9 +480,9 @@ SVCEOF
 systemctl daemon-reload
 systemctl enable esp-bridge.service
 
-# ── 11. Sudo permissions ──
+# ── 10. Sudo permissions ──
 echo ""
-echo "[11/13] Configuring sudoers..."
+echo "[10/12] Configuring sudoers..."
 
 cat > /etc/sudoers.d/esp-bridge << SUDOEOF
 $REAL_USER ALL=(ALL) NOPASSWD: /bin/systemctl start snapclient
@@ -511,14 +491,14 @@ $REAL_USER ALL=(ALL) NOPASSWD: /usr/bin/hostnamectl set-hostname *
 SUDOEOF
 chmod 440 /etc/sudoers.d/esp-bridge
 
-# ── 12. Enable user linger (already done above, ensure it's set) ──
+# ── 11. Enable user linger (already done above, ensure it's set) ──
 echo ""
-echo "[12/13] Enabling user linger..."
+echo "[11/12] Enabling user linger..."
 loginctl enable-linger "$REAL_USER"
 
-# ── 13. Avahi mDNS — IPv4 only ──
+# ── 12. Avahi mDNS — IPv4 only ──
 echo ""
-echo "[13/13] Configuring Avahi for IPv4 only..."
+echo "[12/12] Configuring Avahi for IPv4 only..."
 
 if grep -q "^use-ipv6" /etc/avahi/avahi-daemon.conf; then
     sed -i 's/^#*use-ipv6\s*=.*/use-ipv6=no/' /etc/avahi/avahi-daemon.conf
@@ -563,7 +543,6 @@ echo "   - BT mode:   PulseAudio ON, snapclient OFF, loopback loaded by bridge"
 echo "   - BT agent auto-pairs any device, removes bonding on disconnect"
 echo ""
 echo " Config files:"
-echo "   /etc/asound.conf"
 echo "   /etc/pulse/daemon.conf"
 echo "   /etc/pulse/client.conf"
 echo "   /etc/bluetooth/main.conf"
