@@ -18,6 +18,30 @@ echo " User: $REAL_USER"
 echo " Home: $REAL_HOME"
 echo "========================================="
 
+# ── Prompt for static IP settings ──
+echo ""
+echo "--- Static IP Configuration for eth0 ---"
+read -rp "Static IP address (e.g. 192.168.1.100): " STATIC_IP
+read -rp "Subnet prefix length (e.g. 24 for /24): " SUBNET
+read -rp "Gateway (e.g. 192.168.1.1): " GATEWAY
+read -rp "DNS server (e.g. 192.168.1.1 or 8.8.8.8): " DNS
+read -rp "Disable WiFi? [y/N]: " DISABLE_WIFI
+echo ""
+echo "  IP:      $STATIC_IP/$SUBNET"
+echo "  Gateway: $GATEWAY"
+echo "  DNS:     $DNS"
+if [[ "$DISABLE_WIFI" =~ ^[Yy]$ ]]; then
+    echo "  WiFi:    disabled"
+else
+    echo "  WiFi:    enabled"
+fi
+echo ""
+read -rp "Confirm? [y/N]: " CONFIRM
+if [[ ! "$CONFIRM" =~ ^[Yy]$ ]]; then
+    echo "Aborted."
+    exit 1
+fi
+
 # ── 1. Update package lists only (no upgrade) ──
 echo ""
 echo "[1/9] Updating package lists..."
@@ -163,9 +187,9 @@ RestartSec=2
 WantedBy=multi-user.target
 SVCEOF
 
-# ── 7. Create UART bridge service ──
+# ── 7. Create Server bridge service ──
 echo ""
-echo "[7/9] Setting up UART bridge..."
+echo "[7/9] Setting up Server bridge..."
 
 BRIDGE_DIR="$REAL_HOME/server_bridge"
 mkdir -p "$BRIDGE_DIR"
@@ -233,6 +257,19 @@ net.ipv4.tcp_keepalive_probes = 3
 EOF
 sudo sysctl -p /etc/sysctl.d/99-tcp-retries.conf
 
+# ── Static IP for eth0 ──
+echo ""
+echo "Configuring static IP for eth0..."
+
+nmcli con add type ethernet ifname eth0 con-name ethernet \
+  ip4 "$STATIC_IP/$SUBNET" gw4 "$GATEWAY"
+nmcli con mod ethernet ipv4.dns "$DNS"
+nmcli con mod ethernet ipv4.method manual
+
+if [[ "$DISABLE_WIFI" =~ ^[Yy]$ ]]; then
+    nmcli radio wifi off
+fi
+
 echo ""
 echo "========================================="
 echo " Setup complete!"
@@ -249,6 +286,11 @@ echo " Config files:"
 echo "   /etc/snapserver.conf"
 echo "   /etc/modprobe.d/g_audio.conf"
 echo "   $PW_CONF_DIR/96khz.conf"
+echo ""
+echo " Network:"
+echo "   eth0 static IP: $STATIC_IP/$SUBNET"
+echo "   Gateway:        $GATEWAY"
+echo "   DNS:            $DNS"
 echo ""
 echo " REBOOT NOW to apply all changes:"
 echo "   sudo reboot"
