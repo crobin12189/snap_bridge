@@ -18,12 +18,13 @@ from typing import Optional
 
 import serial
 
-try:
-    import RPi.GPIO as GPIO
-    GPIO_AVAILABLE = True
-except ImportError:
-    GPIO_AVAILABLE = False
-    logging.warning("RPi.GPIO not available — GPIO control disabled")
+# gpioset/gpioget CLI tools are used — no Python GPIO library needed.
+# Requires: sudo apt install gpiod  (usually pre-installed on Raspbian)
+# User must be in the gpio group: sudo usermod -aG gpio $USER
+import shutil
+GPIO_AVAILABLE = bool(shutil.which("gpioset") and shutil.which("gpioget"))
+if not GPIO_AVAILABLE:
+    logging.warning("gpioset/gpioget not found — GPIO control disabled")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -69,34 +70,73 @@ PW_HASH_FILE       = "/etc/zone_password.hash"
 PW_DEFAULT         = "anjay1234"
 
 # ── GPIO pin definitions ──
-GPIO_DSP   = 17    # DSP power relay
-GPIO_AMP   = 27    # AMP power relay
+GPIO_DSP   = 17    # DSP power relay (BCM numbering)
+GPIO_AMP   = 27    # AMP power relay (BCM numbering)
 GPIO_DELAY = 10.0  # seconds between DSP and AMP
+GPIO_CHIP  = "gpiochip0"
+
+# Track output state in software since gpioget reads actual pin level
+# and we drive outputs, so we just remember what we last set.
+_gpio_state: dict = {GPIO_DSP: False, GPIO_AMP: False}
 
 
-# ── GPIO helpers ──
+# ── GPIO helpers (gpioset/gpioget CLI — no root, user needs gpio group) ──
 def gpio_init():
     if not GPIO_AVAILABLE:
         return
-    GPIO.setmode(GPIO.BCM)
-    GPIO.setwarnings(False)
-    GPIO.setup(GPIO_DSP, GPIO.OUT, initial=GPIO.LOW)
-    GPIO.setup(GPIO_AMP, GPIO.OUT, initial=GPIO.LOW)
-    log.info("GPIO initialized — DSP=GPIO%d AMP=GPIO%d", GPIO_DSP, GPIO_AMP)
+    # Drive both pins LOW on startup via gpioset.
+    # gpioset holds the line only for the duration of the call when using
+    # --mode=exit, but the default mode sets and exits which is fine for
+    # output relays — the kernel keeps the last value.
+    for pin in (GPIO_DSP, GPIO_AMP):
+        try:
+            subprocess.run(
+                ["gpioset", GPIO_CHIP, f"{pin}=0"],
+                timeout=3, capture_output=True, check=True
+            )
+        except Exception as e:
+            log.error("gpio_init pin %d failed: %s", pin, e)
+    _gpio_state[GPIO_DSP] = False
+    _gpio_state[GPIO_AMP] = False
+    log.info("GPIO initialised via gpioset — DSP=GPIO%d AMP=GPIO%d", GPIO_DSP, GPIO_AMP)
 
 
 def gpio_get(pin: int) -> bool:
+    """Return last-set state from our software cache (we drive outputs)."""
     if not GPIO_AVAILABLE:
         return False
-    return GPIO.input(pin) == GPIO.HIGH
+    return _gpio_state.get(pin, False)
 
 
 def gpio_set(pin: int, state: bool):
     if not GPIO_AVAILABLE:
         log.info("GPIO%d -> %s (simulated)", pin, "HIGH" if state else "LOW")
+        _gpio_state[pin] = state
         return
-    GPIO.output(pin, GPIO.HIGH if state else GPIO.LOW)
-    log.info("GPIO%d -> %s", pin, "HIGH" if state else "LOW")
+    val = 1 if state else 0
+    try:
+        subprocess.run(
+            ["gpioset", GPIO_CHIP, f"{pin}={val}"],
+            timeout=3, capture_output=True, check=True
+        )
+        _gpio_state[pin] = state
+        log.info("GPIO%d -> %s", pin, "HIGH" if state else "LOW")
+    except Exception as e:
+        log.error("gpio_set GPIO%d failed: %s", pin, e)
+
+
+def gpio_cleanup():
+    """Drive both relay pins LOW on shutdown."""
+    if not GPIO_AVAILABLE:
+        return
+    for pin in (GPIO_DSP, GPIO_AMP):
+        try:
+            subprocess.run(
+                ["gpioset", GPIO_CHIP, f"{pin}=0"],
+                timeout=3, capture_output=True
+            )
+        except Exception:
+            pass
 
 
 # ── CRC-8 ──
@@ -452,7 +492,7 @@ def bt_stop_discoverable():
         pass
 
 
-def bt_get_connected_device():
+def bt_get_connected_device() -> tuple[bool, str]:
     try:
         result = subprocess.run(["bluetoothctl", "info"],
                                 capture_output=True, text=True, timeout=5)
@@ -466,7 +506,69 @@ def bt_get_connected_device():
         return False, ""
 
 
+# ── A2DP source (AVRCP) volume helpers ──
+
+def _find_bt_source_name() -> Optional[str]:
+    """Return the PulseAudio source name for the connected A2DP device, if any."""
+    try:
+        result = subprocess.run(
+            ["pactl", "list", "sources", "short"],
+            capture_output=True, text=True, timeout=5
+        )
+        for line in result.stdout.splitlines():
+            # Lines look like: 7\tbluez_source.AA_BB_CC_DD_EE_FF.a2dp_source\t...
+            parts = line.split()
+            if len(parts) >= 2 and "bluez_source" in parts[1] and "a2dp_source" in parts[1]:
+                return parts[1]
+    except Exception as e:
+        log.warning("Could not list pactl sources: %s", e)
+    return None
+
+
+def bt_get_source_volume() -> Optional[int]:
+    """
+    Read volume from the A2DP source (phone side).
+    Returns 0-100 percent, or None if no source found.
+    """
+    source = _find_bt_source_name()
+    if not source:
+        return None
+    try:
+        result = subprocess.run(
+            ["pactl", "get-source-volume", source],
+            capture_output=True, text=True, timeout=3
+        )
+        m = re.search(r"(\d+)%", result.stdout)
+        if m:
+            return int(m.group(1))
+    except Exception as e:
+        log.warning("bt_get_source_volume error: %s", e)
+    return None
+
+
+def bt_set_source_volume(percent: int) -> bool:
+    """
+    Set volume on the A2DP source — this sends AVRCP volume to the phone.
+    Returns True on success.
+    """
+    source = _find_bt_source_name()
+    if not source:
+        log.warning("bt_set_source_volume: no A2DP source found")
+        return False
+    try:
+        subprocess.run(
+            ["pactl", "set-source-volume", source, f"{percent}%"],
+            capture_output=True, timeout=3, check=True
+        )
+        log.info("AVRCP volume set: %s -> %d%%", source, percent)
+        return True
+    except Exception as e:
+        log.warning("bt_set_source_volume error: %s", e)
+        return False
+
+
 def pa_get_volume() -> int:
+    """Read output sink volume (for the loopback/speaker side)."""
     try:
         result = subprocess.run(["pactl", "get-sink-volume", "@DEFAULT_SINK@"],
                                 capture_output=True, text=True, timeout=3)
@@ -479,6 +581,7 @@ def pa_get_volume() -> int:
 
 
 def pa_set_volume(percent: int):
+    """Set output sink volume."""
     try:
         subprocess.run(["pactl", "set-sink-volume", "@DEFAULT_SINK@",
                         f"{percent}%"], timeout=3, capture_output=True)
@@ -557,10 +660,94 @@ class PasswordListener(threading.Thread):
                 log.error("Password listener error: %s", e)
 
 
+# ── pactl subscribe watcher for BT source volume changes ──
+class PactlSourceWatcher(threading.Thread):
+    """
+    Runs `pactl subscribe` and:
+      - fires on_volume_change(percent) on source 'change' events
+        (phone adjusted volume while already connected)
+      - fires on_source_appeared(percent) on source 'new' events
+        (A2DP source just registered — device finished pairing/connecting)
+
+    Runs only while BT mode is active.
+    """
+
+    def __init__(self, on_volume_change, on_source_appeared):
+        super().__init__(daemon=True)
+        self._on_vol      = on_volume_change
+        self._on_appeared = on_source_appeared
+        self._active      = False
+        self._proc: Optional[subprocess.Popen] = None
+        self._lock        = threading.Lock()
+
+    def activate(self):
+        """Call when entering BT mode."""
+        with self._lock:
+            self._active = True
+        log.info("PactlSourceWatcher activated")
+
+    def deactivate(self):
+        """Call when leaving BT mode."""
+        with self._lock:
+            self._active = False
+        log.info("PactlSourceWatcher deactivated")
+
+    def run(self):
+        while True:
+            with self._lock:
+                active = self._active
+            if not active:
+                time.sleep(0.5)
+                continue
+
+            log.info("Starting pactl subscribe watcher")
+            try:
+                proc = subprocess.Popen(
+                    ["pactl", "subscribe"],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                    text=True,
+                )
+                with self._lock:
+                    self._proc = proc
+
+                for line in proc.stdout:
+                    with self._lock:
+                        active = self._active
+                    if not active:
+                        break
+
+                    # 'new' on source  → A2DP source just appeared (device connected/paired)
+                    if "new" in line and "source" in line:
+                        # Give PulseAudio a moment to fully register the source
+                        time.sleep(0.5)
+                        vol = bt_get_source_volume()
+                        if vol is not None:
+                            log.info("A2DP source appeared, initial volume: %d%%", vol)
+                            self._on_appeared(vol)
+
+                    # 'change' on source → phone adjusted volume
+                    elif "change" in line and "source" in line:
+                        # Debounce so volume has settled in PulseAudio
+                        time.sleep(0.15)
+                        vol = bt_get_source_volume()
+                        if vol is not None:
+                            self._on_vol(vol)
+
+                proc.terminate()
+                proc.wait()
+            except Exception as e:
+                log.warning("PactlSourceWatcher error: %s", e)
+                time.sleep(2)
+            finally:
+                with self._lock:
+                    self._proc = None
+
+
 # ── Main bridge ──
 class ClientBridge:
     ESP_TIMEOUT_S   = 20
-    POLL_INTERVAL_S = 2.0
+    POLL_INTERVAL_S = 5.0   # BT poll interval (reduced — watcher handles most events)
     RPC_RETRY_S     = 5.0
 
     def __init__(self, serial_port: str, baud: int):
@@ -572,9 +759,7 @@ class ClientBridge:
         self.hostname = get_hostname()
         self.volume   = 0
 
-        # ── Per-relay state (tracked independently on the Pi) ──
-        # dsp_on / amp_on reflect the actual GPIO pin states.
-        # powered = True only when BOTH are on — this is what we report to the server.
+        # ── Per-relay state ──
         self.dsp_on = False
         self.amp_on = False
 
@@ -592,6 +777,9 @@ class ClientBridge:
         # BT state
         self.bt_connected = False
         self.bt_dev_name  = ""
+        # Guard to prevent echo: when we set the source volume ourselves,
+        # ignore the resulting pactl subscribe event for a short window.
+        self._bt_vol_set_time = 0.0
 
         # ESP tracking
         self._esp_connected     = False
@@ -608,24 +796,24 @@ class ClientBridge:
         self._ctrl_clients: list[socket.socket] = []
         self._ctrl_lock = threading.Lock()
 
+        # pactl subscribe watcher for AVRCP volume from phone
+        self._source_watcher = PactlSourceWatcher(
+            self._on_bt_source_volume_changed,
+            self._on_bt_source_appeared,
+        )
+        self._source_watcher.start()
+
     # ── Convenience property ──────────────────────────────────────────────────
     @property
     def powered(self) -> bool:
-        """True only when both DSP and AMP relays are on."""
         return self.dsp_on and self.amp_on
 
     # ── Relay sync helpers ────────────────────────────────────────────────────
     def _read_relay_state(self):
-        """Sync dsp_on/amp_on from actual GPIO pin levels."""
         self.dsp_on = gpio_get(GPIO_DSP)
         self.amp_on = gpio_get(GPIO_AMP)
 
     def _power_on_missing(self):
-        """
-        Turn on whichever relays are currently off, preserving relays already on.
-        Sequence: DSP first (if off) → delay → AMP (if off).
-        If DSP is already on, skip straight to AMP with no delay.
-        """
         if not self.dsp_on:
             log.info("Power ON: DSP was OFF — turning DSP on")
             gpio_set(GPIO_DSP, True)
@@ -646,10 +834,6 @@ class ClientBridge:
             log.info("Power ON: AMP already ON — nothing to do")
 
     def _power_off_all(self):
-        """
-        Turn off both relays. Sequence: AMP first → delay → DSP.
-        Skip any that are already off.
-        """
         if self.amp_on:
             log.info("Power OFF: turning AMP off")
             gpio_set(GPIO_AMP, False)
@@ -709,15 +893,58 @@ class ClientBridge:
         self._last_state_sent = payload
         self.send_frame(MSG_STATE_UPDATE, payload)
 
-    def _send_power_state(self):
-        """Report current powered state to server bridge via ctrl socket."""
+    # ────────────────────────────────────────────
+    # AVRCP / A2DP source volume callbacks
+    # ────────────────────────────────────────────
+    def _on_bt_source_appeared(self, percent: int):
+        """
+        Called by PactlSourceWatcher when an A2DP source is newly registered
+        (i.e. a device just finished pairing/connecting).
+        Syncs initial volume from the phone and propagates everywhere.
+        """
+        if self.mode != MODE_BT:
+            return
+        log.info("BT source appeared — syncing initial volume: %d%%", percent)
+        self.volume = percent
+        # Sync sink so loopback level matches
+        pa_set_volume(percent)
+        self.send_vol_update(percent)
+        self.send_state(force=True)
         self.broadcast_ctrl_state()
 
+    def _on_bt_source_volume_changed(self, percent: int):
+        """
+        Called by PactlSourceWatcher when the phone changes volume.
+        Ignored for 1 second after we ourselves set the volume (echo guard).
+        """
+        if self.mode != MODE_BT:
+            return
+        if time.time() - self._bt_vol_set_time < 1.0:
+            log.debug("BT source vol event suppressed (echo guard): %d%%", percent)
+            return
+        if percent == self.volume:
+            return
+        log.info("Phone changed BT volume: %d%% -> %d%%", self.volume, percent)
+        self.volume = percent
+        self.send_vol_update(percent)
+        self.send_state()
+        self.broadcast_ctrl_state()
+
+    def _set_bt_volume(self, percent: int):
+        """
+        Set volume in BT mode: update A2DP source (AVRCP → phone) and
+        also the sink (loopback speaker). Marks the echo-guard timer.
+        """
+        percent = max(0, min(100, percent))
+        self._bt_vol_set_time = time.time()
+        bt_set_source_volume(percent)   # → phone via AVRCP
+        pa_set_volume(percent)          # → local loopback/speaker
+        self.volume = percent
+
     # ────────────────────────────────────────────
-    # Boot sequence — triggered by MSG_BOOT_STATUS_REQ from ESP
+    # Boot sequence
     # ────────────────────────────────────────────
     def _do_boot_sequence(self):
-        """Run GPIO boot sequence and notify ESP via MSG_BOOT_STATUS."""
         if not self._power_lock.acquire(blocking=False):
             log.warning("Boot sequence already in progress")
             return
@@ -728,63 +955,47 @@ class ClientBridge:
                 return
 
             log.info("=== BOOT SEQUENCE START ===")
-
-            # Tell ESP: initializing
             self.send_frame(MSG_BOOT_STATUS, bytes([0]))
             log.info("Sent BOOT_STATUS: initializing")
 
-            # Read actual GPIO state first (handles unexpected pre-power)
             self._read_relay_state()
             log.info("Pre-boot relay state: DSP=%s AMP=%s", self.dsp_on, self.amp_on)
 
-            # Power on whatever is missing
             self._power_on_missing()
 
             self._boot_done = True
             log.info("=== BOOT SEQUENCE DONE — DSP=%s AMP=%s powered=%s ===",
                      self.dsp_on, self.amp_on, self.powered)
 
-            # Tell ESP: done
             self.send_frame(MSG_BOOT_STATUS, bytes([1]))
             log.info("Sent BOOT_STATUS: done")
 
-            # Notify server of current power state
             self.broadcast_ctrl_state()
-
         finally:
             self._power_lock.release()
 
     # ────────────────────────────────────────────
-    # Power sequence — triggered by server toggle
+    # Power sequences
     # ────────────────────────────────────────────
     def _do_power_sequence(self, powered: bool):
-        """
-        Power ON:  turn on only what is currently off (preserves partial state).
-        Power OFF: turn off everything.
-        """
         if not self._power_lock.acquire(blocking=False):
             log.warning("Power sequence already in progress")
             return
         try:
             log.info("Power sequence requested: %s (DSP=%s AMP=%s)",
                      "ON" if powered else "OFF", self.dsp_on, self.amp_on)
-
             if powered:
                 self._power_on_missing()
             else:
                 self._power_off_all()
-
             log.info("Power sequence complete — DSP=%s AMP=%s powered=%s",
                      self.dsp_on, self.amp_on, self.powered)
-
             self.broadcast_ctrl_state()
             self.send_state(force=True)
-
         finally:
             self._power_lock.release()
 
     def _do_dsp_sequence(self, on: bool):
-        """Toggle DSP relay only — no delay, no AMP involvement."""
         if not self._power_lock.acquire(blocking=False):
             log.warning("Power sequence already in progress")
             return
@@ -800,7 +1011,6 @@ class ClientBridge:
             self._power_lock.release()
 
     def _do_amp_sequence(self, on: bool):
-        """Toggle AMP relay only — no delay, no DSP involvement."""
         if not self._power_lock.acquire(blocking=False):
             log.warning("Power sequence already in progress")
             return
@@ -816,7 +1026,6 @@ class ClientBridge:
             self._power_lock.release()
 
     def _reconnect_after_remove(self):
-        """Restart snapclient so it re-registers with the server after being removed."""
         log.info("Reconnect after remove: restarting snapclient")
         snapclient_stop()
         self.rpc.disconnect()
@@ -929,9 +1138,7 @@ class ClientBridge:
                 "bt_connected":   self.bt_connected,
                 "bt_dev_name":    self.bt_dev_name,
                 "client_name":    self.hostname,
-                # powered = both relays on; server uses this for on/off display
                 "powered":        self.powered,
-                # expose individual relay states for diagnostics / future use
                 "dsp_on":         self.dsp_on,
                 "amp_on":         self.amp_on,
             })
@@ -967,9 +1174,10 @@ class ClientBridge:
 
         elif mtype == "set_volume":
             vol = msg.get("volume", self.volume)
-            self.volume = vol
             if self.mode == MODE_BT:
-                pa_set_volume(vol)
+                self._set_bt_volume(vol)
+            else:
+                self.volume = vol
             self.send_vol_update(vol)
             self.send_state(force=True)
 
@@ -1089,6 +1297,8 @@ class ClientBridge:
         self.mode = MODE_SYNC
         self.send_frame(MSG_MODE_SWITCHING, bytes([MODE_SYNC]))
 
+        self._source_watcher.deactivate()
+
         bt_disconnect_all()
         bt_stop_discoverable()
         pulseaudio_stop()
@@ -1145,7 +1355,21 @@ class ClientBridge:
             log.error("loopback load failed: %s", e)
 
         bt_start_discoverable()
-        self.volume = pa_get_volume()
+
+        # Read initial volume from the A2DP source (phone's current volume)
+        # rather than the sink, so we start in sync with the phone.
+        bt_vol = bt_get_source_volume()
+        if bt_vol is not None:
+            log.info("Initial BT source volume from phone: %d%%", bt_vol)
+            self.volume = bt_vol
+            # Sync sink to match so loopback level is consistent
+            pa_set_volume(bt_vol)
+        else:
+            log.info("No A2DP source yet — using last known volume: %d%%", self.volume)
+
+        # Activate the pactl watcher so we catch phone-side changes
+        self._source_watcher.activate()
+
         self.send_state(force=True)
 
     def _do_mode_switch(self, new_mode: int):
@@ -1209,9 +1433,8 @@ class ClientBridge:
                 else:
                     log.warning("VOL_SET ignored — RPC not ready")
             else:
-                pa_set_volume(vol)
-                self.volume = vol
-            self.broadcast_ctrl_state()
+                # BT mode: set both source (AVRCP → phone) and sink
+                self._set_bt_volume(vol)
 
         elif msg_type == MSG_MODE_SYNC:
             if self.mode != MODE_SYNC:
@@ -1297,7 +1520,6 @@ class ClientBridge:
                     if time.time() - self._esp_vol_set_time >= 1.0:
                         self.volume = vol
                         self.send_vol_update(vol)
-                        self.broadcast_ctrl_state()
             elif method in ("Client.OnConnect", "Client.OnDisconnect"):
                 self.client_id = None
                 self._last_rpc_attempt = 0.0
@@ -1305,24 +1527,39 @@ class ClientBridge:
                 self.broadcast_ctrl_state()
 
     # ────────────────────────────────────────────
-    # BT polling
+    # BT polling (periodic fallback — watcher handles real-time events)
     # ────────────────────────────────────────────
     def poll_bt(self):
         conn, name = bt_get_connected_device()
-        hw_vol     = pa_get_volume()
-        changed    = False
+        changed = False
 
         if conn != self.bt_connected:
             self.bt_connected = conn
             changed = True
+            if conn:
+                # Device just connected — read its current volume immediately
+                bt_vol = bt_get_source_volume()
+                if bt_vol is not None:
+                    log.info("BT device connected, initial volume: %d%%", bt_vol)
+                    if bt_vol != self.volume:
+                        self.volume = bt_vol
+                        pa_set_volume(bt_vol)
+                        self.send_vol_update(bt_vol)
         if name != self.bt_dev_name:
             self.bt_dev_name = name
             changed = True
-        if hw_vol != self.volume:
-            if time.time() - self._esp_vol_set_time >= 1.0:
-                self.send_vol_update(hw_vol)
-            self.volume = hw_vol
-            changed = True
+
+        # Periodic source volume check as fallback
+        # (in case a subscribe event was missed)
+        if conn and time.time() - self._bt_vol_set_time >= 1.0:
+            src_vol = bt_get_source_volume()
+            if src_vol is not None and src_vol != self.volume:
+                log.info("BT poll: volume drift detected %d%% -> %d%%",
+                         self.volume, src_vol)
+                self.volume = src_vol
+                pa_set_volume(src_vol)
+                self.send_vol_update(src_vol)
+                changed = True
 
         if changed:
             self.send_state()
@@ -1335,7 +1572,6 @@ class ClientBridge:
         log.info("Client bridge — %s @ %d — hostname: %s",
                  self.ser.port, self.ser.baudrate, self.hostname)
 
-        # Initialize GPIO — read actual pin state at startup
         gpio_init()
         self._read_relay_state()
         log.info("Startup relay state: DSP=%s AMP=%s", self.dsp_on, self.amp_on)
@@ -1372,7 +1608,6 @@ class ClientBridge:
                                     if time.time() - self._esp_vol_set_time >= 1.0:
                                         self.volume = vol
                                         self.send_vol_update(vol)
-                                        self.broadcast_ctrl_state()
                             except Exception:
                                 self.rpc.disconnect()
                                 self.client_id = None
@@ -1399,8 +1634,7 @@ def main():
     except KeyboardInterrupt:
         log.info("Shutting down")
         bridge.rpc.disconnect()
-        if GPIO_AVAILABLE:
-            GPIO.cleanup()
+        gpio_cleanup()
 
 
 if __name__ == "__main__":
