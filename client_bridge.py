@@ -42,6 +42,8 @@ MSG_PING             = 0x04
 MSG_MODE_SYNC        = 0x05
 MSG_MODE_BT          = 0x06
 MSG_POWER_SET        = 0x07
+MSG_DSP_SET          = 0x08
+MSG_AMP_SET          = 0x09
 MSG_ACK              = 0x10
 MSG_CLIENT_VOL_UPD   = 0x12
 MSG_PONG             = 0x13
@@ -274,7 +276,8 @@ class SnapcastRPC:
         return self.sock is not None
 
     def _send_request(self, method: str, params: dict) -> Optional[dict]:
-        if not self.sock:
+        sock = self.sock
+        if not sock:
             return None
         with self._lock:
             self._req_id += 1
@@ -286,7 +289,7 @@ class SnapcastRPC:
         }) + "\r\n"
 
         try:
-            self.sock.sendall(msg.encode())
+            sock.sendall(msg.encode())
         except OSError as e:
             log.error("RPC send failed: %s", e)
             self.disconnect()
@@ -295,13 +298,13 @@ class SnapcastRPC:
         deadline = time.time() + 5.0
         while time.time() < deadline:
             try:
-                ready, _, _ = select.select([self.sock], [], [], 0.5)
+                ready, _, _ = select.select([sock], [], [], 0.5)
             except (ValueError, OSError):
                 self.disconnect()
                 return None
             if ready:
                 try:
-                    data = self.sock.recv(4096)
+                    data = sock.recv(4096)
                 except OSError as e:
                     log.error("RPC recv failed: %s", e)
                     self.disconnect()
@@ -627,6 +630,8 @@ class ClientBridge:
             log.info("Power ON: DSP was OFF — turning DSP on")
             gpio_set(GPIO_DSP, True)
             self.dsp_on = True
+            self.broadcast_ctrl_state()
+            self.send_state(force=True)
             time.sleep(GPIO_DELAY)
         else:
             log.info("Power ON: DSP already ON — skipping DSP delay")
@@ -635,6 +640,8 @@ class ClientBridge:
             log.info("Power ON: turning AMP on")
             gpio_set(GPIO_AMP, True)
             self.amp_on = True
+            self.broadcast_ctrl_state()
+            self.send_state(force=True)
         else:
             log.info("Power ON: AMP already ON — nothing to do")
 
@@ -647,6 +654,8 @@ class ClientBridge:
             log.info("Power OFF: turning AMP off")
             gpio_set(GPIO_AMP, False)
             self.amp_on = False
+            self.broadcast_ctrl_state()
+            self.send_state(force=True)
         else:
             log.info("Power OFF: AMP already OFF — skipping")
 
@@ -656,6 +665,8 @@ class ClientBridge:
             log.info("Power OFF: turning DSP off")
             gpio_set(GPIO_DSP, False)
             self.dsp_on = False
+            self.broadcast_ctrl_state()
+            self.send_state(force=True)
         else:
             log.info("Power OFF: DSP already OFF — skipping")
 
@@ -766,12 +777,55 @@ class ClientBridge:
             log.info("Power sequence complete — DSP=%s AMP=%s powered=%s",
                      self.dsp_on, self.amp_on, self.powered)
 
-            # Report back to server bridge and ESP
             self.broadcast_ctrl_state()
             self.send_state(force=True)
 
         finally:
             self._power_lock.release()
+
+    def _do_dsp_sequence(self, on: bool):
+        """Toggle DSP relay only — no delay, no AMP involvement."""
+        if not self._power_lock.acquire(blocking=False):
+            log.warning("Power sequence already in progress")
+            return
+        try:
+            log.info("DSP sequence: %s", "ON" if on else "OFF")
+            gpio_set(GPIO_DSP, on)
+            self.dsp_on = gpio_get(GPIO_DSP)
+            log.info("DSP sequence complete — dsp=%s amp=%s powered=%s",
+                     self.dsp_on, self.amp_on, self.powered)
+            self.broadcast_ctrl_state()
+            self.send_state(force=True)
+        finally:
+            self._power_lock.release()
+
+    def _do_amp_sequence(self, on: bool):
+        """Toggle AMP relay only — no delay, no DSP involvement."""
+        if not self._power_lock.acquire(blocking=False):
+            log.warning("Power sequence already in progress")
+            return
+        try:
+            log.info("AMP sequence: %s", "ON" if on else "OFF")
+            gpio_set(GPIO_AMP, on)
+            self.amp_on = gpio_get(GPIO_AMP)
+            log.info("AMP sequence complete — dsp=%s amp=%s powered=%s",
+                     self.dsp_on, self.amp_on, self.powered)
+            self.broadcast_ctrl_state()
+            self.send_state(force=True)
+        finally:
+            self._power_lock.release()
+
+    def _reconnect_after_remove(self):
+        """Restart snapclient so it re-registers with the server after being removed."""
+        log.info("Reconnect after remove: restarting snapclient")
+        snapclient_stop()
+        self.rpc.disconnect()
+        self.client_id = None
+        self.server_ip = None
+        self._last_rpc_attempt = 0.0
+        time.sleep(1)
+        snapclient_start()
+        log.info("Reconnect after remove: snapclient restarted")
 
     # ────────────────────────────────────────────
     # UDP discovery listener
@@ -938,7 +992,12 @@ class ClientBridge:
                 pass
 
         elif mtype == "removed":
-            log.info("Server removed us from Snapcast — will reconnect on next sync")
+            log.info("Server removed us — restarting snapclient to re-register")
+            if self.mode == MODE_SYNC:
+                threading.Thread(
+                    target=self._reconnect_after_remove,
+                    daemon=True,
+                ).start()
 
     # ────────────────────────────────────────────
     # Password
@@ -1178,6 +1237,28 @@ class ClientBridge:
             threading.Thread(
                 target=self._do_power_sequence,
                 args=(powered,),
+                daemon=True,
+            ).start()
+
+        elif msg_type == MSG_DSP_SET:
+            if len(payload) < 1:
+                return
+            on = payload[0] != 0
+            log.info("MSG_DSP_SET from ESP: %s", on)
+            threading.Thread(
+                target=self._do_dsp_sequence,
+                args=(on,),
+                daemon=True,
+            ).start()
+
+        elif msg_type == MSG_AMP_SET:
+            if len(payload) < 1:
+                return
+            on = payload[0] != 0
+            log.info("MSG_AMP_SET from ESP: %s", on)
+            threading.Thread(
+                target=self._do_amp_sequence,
+                args=(on,),
                 daemon=True,
             ).start()
 
