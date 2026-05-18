@@ -66,6 +66,15 @@ echo "[3/9] Configuring boot config and USB gadget audio..."
 
 CONFIG=/boot/firmware/config.txt
 
+# Enable SPI for W5500
+sed -i 's/^#dtparam=spi=on/dtparam=spi=on/' "$CONFIG"
+
+# Download and install W5500 overlay
+wget -O /tmp/w5500-overlay.dts \
+    "https://raw.githubusercontent.com/crobin12189/snap_bridge/main/w5500-overlay.dts"
+dtc -I dts -O dtb -o /boot/overlays/w5500-driver.dtbo /tmp/w5500-overlay.dts
+rm /tmp/w5500-overlay.dts
+
 # Disable vc4-kms-v3d (comment it out if uncommented)
 sed -i 's/^dtoverlay=vc4-kms-v3d/#dtoverlay=vc4-kms-v3d/' "$CONFIG"
 
@@ -81,6 +90,7 @@ cat >> "$CONFIG" << 'CFGEOF'
 dtoverlay=dwc2,dr_mode=peripheral
 enable_uart=1
 dtoverlay=miniuart-bt
+dtoverlay=w5500-driver
 CFGEOF
 
 # Load dwc2 and g_audio modules on boot
