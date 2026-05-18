@@ -73,6 +73,7 @@ usermod -a -G bluetooth "$REAL_USER"
 usermod -a -G dialout "$REAL_USER"
 usermod -a -G pulse "$REAL_USER"
 usermod -a -G pulse-access "$REAL_USER"
+usermod -a -G gpio "$REAL_USER"
 
 # ── 3. config.txt — UART, I2S, disable onboard BT ──
 echo ""
