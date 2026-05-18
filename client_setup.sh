@@ -176,6 +176,10 @@ sed -i 's/^#*AutoEnable\s*=.*/AutoEnable = true/' /etc/bluetooth/main.conf
 # Remove Disable=Headset if present (breaks pairing on some phones)
 sed -i '/^Disable=Headset/d' /etc/bluetooth/main.conf
 
+# Add Justworksrepairing always so bt pairing is seamless
+sed -i 's/^#*JustWorksRepairing\s*=.*/JustWorksRepairing = always/' /etc/bluetooth/main.conf
+grep -q "JustWorksRepairing" /etc/bluetooth/main.conf || sed -i '/^\[General\]/a JustWorksRepairing = always' /etc/bluetooth/main.conf
+
 # USB dongle init service — bring hci0 up after bluetooth service
 cat > /etc/systemd/system/bt-init.service << 'EOF'
 [Unit]
