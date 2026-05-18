@@ -60,6 +60,7 @@ apt install -y \
     python3-gi \
     avahi-daemon \
     git \
+    gpiod \
     python3-dev
 
 # Prevent auto-upgrades
