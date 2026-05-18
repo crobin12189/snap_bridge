@@ -25,10 +25,16 @@ read -rp "Static IP address (e.g. 192.168.1.100): " STATIC_IP
 read -rp "Subnet prefix length (e.g. 24 for /24): " SUBNET
 read -rp "Gateway (e.g. 192.168.1.1): " GATEWAY
 read -rp "DNS server (e.g. 192.168.1.1 or 8.8.8.8): " DNS
+read -rp "Disable WiFi? [y/N]: " DISABLE_WIFI
 echo ""
 echo "  IP:      $STATIC_IP/$SUBNET"
 echo "  Gateway: $GATEWAY"
 echo "  DNS:     $DNS"
+if [[ "$DISABLE_WIFI" =~ ^[Yy]$ ]]; then
+    echo "  WiFi:    disabled"
+else
+    echo "  WiFi:    enabled"
+fi
 echo ""
 read -rp "Confirm? [y/N]: " CONFIRM
 if [[ ! "$CONFIRM" =~ ^[Yy]$ ]]; then
@@ -512,14 +518,14 @@ fi
 echo ""
 echo "Configuring static IP for eth0..."
 
-cat >> /etc/dhcpcd.conf << DHCPEOF
+nmcli con add type ethernet ifname eth0 con-name ethernet \
+  ip4 "$STATIC_IP/$SUBNET" gw4 "$GATEWAY"
+nmcli con mod ethernet ipv4.dns "$DNS"
+nmcli con mod ethernet ipv4.method manual
 
-# Static IP for USB ethernet
-interface eth0
-static ip_address=$STATIC_IP/$SUBNET
-static routers=$GATEWAY
-static domain_name_servers=$DNS
-DHCPEOF
+if [[ "$DISABLE_WIFI" =~ ^[Yy]$ ]]; then
+    nmcli radio wifi off
+fi
 
 # ── Clean up PipeWire leftovers ──
 rm -rf "$REAL_HOME/.config/wireplumber" 2>/dev/null || true
