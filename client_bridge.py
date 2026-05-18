@@ -900,14 +900,14 @@ class ClientBridge:
         """
         Called by PactlSourceWatcher when an A2DP source is newly registered
         (i.e. a device just finished pairing/connecting).
-        Syncs initial volume from the phone and propagates everywhere.
+        Sink is always kept at 100% — volume controlled via AVRCP source only.
         """
         if self.mode != MODE_BT:
             return
         log.info("BT source appeared — syncing initial volume: %d%%", percent)
+        time.sleep(0.5)  # wait for loopback to settle
+        pa_set_volume(100)  # sink always at 100%
         self.volume = percent
-        # Sync sink so loopback level matches
-        pa_set_volume(percent)
         self.send_vol_update(percent)
         self.send_state(force=True)
         self.broadcast_ctrl_state()
@@ -932,13 +932,12 @@ class ClientBridge:
 
     def _set_bt_volume(self, percent: int):
         """
-        Set volume in BT mode: update A2DP source (AVRCP → phone) and
-        also the sink (loopback speaker). Marks the echo-guard timer.
+        Set volume in BT mode: update A2DP source (AVRCP → phone).
+        Sink is always at 100% — AVRCP source is the volume control.
         """
         percent = max(0, min(100, percent))
         self._bt_vol_set_time = time.time()
         bt_set_source_volume(percent)   # → phone via AVRCP
-        pa_set_volume(percent)          # → local loopback/speaker
         self.volume = percent
 
     # ────────────────────────────────────────────
@@ -1362,10 +1361,10 @@ class ClientBridge:
         if bt_vol is not None:
             log.info("Initial BT source volume from phone: %d%%", bt_vol)
             self.volume = bt_vol
-            # Sync sink to match so loopback level is consistent
-            pa_set_volume(bt_vol)
         else:
             log.info("No A2DP source yet — using last known volume: %d%%", self.volume)
+        # Sink always at 100% — volume controlled via AVRCP source only
+        pa_set_volume(100)
 
         # Activate the pactl watcher so we catch phone-side changes
         self._source_watcher.activate()
@@ -1543,7 +1542,6 @@ class ClientBridge:
                     log.info("BT device connected, initial volume: %d%%", bt_vol)
                     if bt_vol != self.volume:
                         self.volume = bt_vol
-                        pa_set_volume(bt_vol)
                         self.send_vol_update(bt_vol)
         if name != self.bt_dev_name:
             self.bt_dev_name = name
@@ -1557,7 +1555,6 @@ class ClientBridge:
                 log.info("BT poll: volume drift detected %d%% -> %d%%",
                          self.volume, src_vol)
                 self.volume = src_vol
-                pa_set_volume(src_vol)
                 self.send_vol_update(src_vol)
                 changed = True
 
