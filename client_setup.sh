@@ -105,9 +105,6 @@ enable_uart=1
 
 # Disable onboard Bluetooth — using USB dongle only
 dtoverlay=disable-bt
-
-# I2S DAC
-dtoverlay=hifiberry-dacplus
 CFGEOF
 
 # ── 4. Free UART from serial console ──
