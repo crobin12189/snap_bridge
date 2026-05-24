@@ -26,6 +26,7 @@ read -rp "Subnet prefix length (e.g. 24 for /24): " SUBNET
 read -rp "Gateway (e.g. 192.168.1.1): " GATEWAY
 read -rp "DNS server (e.g. 192.168.1.1 or 8.8.8.8): " DNS
 read -rp "Disable WiFi? [y/N]: " DISABLE_WIFI
+read -rp "Server Pi IP address (e.g. 192.168.1.100): " SERVER_IP
 echo ""
 echo "  IP:      $STATIC_IP/$SUBNET"
 echo "  Gateway: $GATEWAY"
@@ -476,7 +477,7 @@ Wants=bluetooth.service
 [Service]
 Type=simple
 User=$REAL_USER
-ExecStart=/usr/bin/python3 $BRIDGE_DIR/client_bridge.py --port /dev/ttyAMA0 --baud 460800
+ExecStart=/usr/bin/python3 $BRIDGE_DIR/client_bridge.py --port /dev/ttyAMA0 --baud 460800 --server-ip $SERVER_IP
 Restart=always
 RestartSec=3
 Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$USER_ID/bus
