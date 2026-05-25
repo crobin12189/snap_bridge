@@ -106,6 +106,7 @@ enable_uart=1
 
 # Disable onboard Bluetooth — using USB dongle only
 dtoverlay=disable-bt
+dtoverlay=dwc2,dr_mode=host
 CFGEOF
 
 # ── 4. Free UART from serial console ──
