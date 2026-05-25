@@ -12,7 +12,6 @@ from typing import Optional
 
 import serial
 
-# ── Protocol constants ──
 SYNC_0 = 0xAA
 SYNC_1 = 0x55
 MAX_PAYLOAD = 2048
@@ -24,7 +23,6 @@ MSG_PING            = 0x04
 MSG_MODE_SYNC       = 0x05
 MSG_MODE_BT         = 0x06
 MSG_POWER_SET       = 0x07
-MSG_REMOVE_CLIENT   = 0x08
 MSG_RESTART_SERVER  = 0x09
 MSG_ACK             = 0x10
 MSG_CLIENT_LIST     = 0x11
@@ -33,7 +31,6 @@ MSG_PONG            = 0x13
 MSG_STATE_UPDATE    = 0x20
 MSG_MODE_SWITCHING  = 0x21
 MSG_POWER_STATE     = 0x22
-MSG_CLIENT_REMOVED  = 0x23
 MSG_PW_SET          = 0x30
 MSG_PW_ACK          = 0x34
 
@@ -44,12 +41,13 @@ CLIENT_ID_LEN     = 36
 CLIENT_NAME_LEN   = 32
 CLIENT_ENTRY_SIZE = CLIENT_ID_LEN + CLIENT_NAME_LEN + 6
 
-CTRL_PORT            = 7702
-DISCOVERY_PORT       = 7703
-DISCOVERY_INTERVAL_S = 10
-PW_HASH_FILE         = "/etc/zone_password.hash"
-PW_DEFAULT           = "anjay1234"
-PW_BROADCAST_PORT    = 7700
+CTRL_PORT        = 7702
+PW_HASH_FILE     = "/etc/zone_password.hash"
+PW_DEFAULT       = "anjay1234"
+PW_BROADCAST_PORT = 7700
+
+PING_INTERVAL_S  = 5
+PING_MISS_MAX    = 2
 
 logging.basicConfig(
     level=logging.INFO,
@@ -59,7 +57,6 @@ logging.basicConfig(
 log = logging.getLogger("server_bridge")
 
 
-# ── CRC-8 ──
 def crc8(data: bytes) -> int:
     crc = 0x00
     for b in data:
@@ -76,7 +73,6 @@ def build_frame(msg_type: int, payload: bytes = b"") -> bytes:
     return header + payload + bytes([crc8(crc_data)])
 
 
-# ── Hash pull server — port 7701 ──
 class HashPullServer(threading.Thread):
     def __init__(self, get_hash_fn):
         super().__init__(daemon=True)
@@ -87,19 +83,17 @@ class HashPullServer(threading.Thread):
         srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         srv.bind(("0.0.0.0", 7701))
         srv.listen(10)
-        log.info("Hash pull server listening on port 7701")
+        log.info("Hash pull server on port 7701")
         while True:
             try:
                 conn, addr = srv.accept()
                 with conn:
-                    h = self._get_hash()
-                    conn.sendall(h.encode("ascii"))
-                log.info("Sent hash to %s on pull request", addr[0])
+                    conn.sendall(self._get_hash().encode("ascii"))
+                log.info("Sent hash to %s", addr[0])
             except Exception as e:
                 log.error("Hash pull server error: %s", e)
 
 
-# ── Snapcast JSON-RPC ──
 class SnapcastClient:
     def __init__(self, host="127.0.0.1", port=1705):
         self.host = host
@@ -169,16 +163,6 @@ class SnapcastClient:
             "volume": {"percent": volume, "muted": muted},
         })
 
-    def delete_client(self, client_id: str) -> bool:
-        """Remove a client from Snapcast permanently."""
-        try:
-            self._send_request("Server.DeleteClient", {"id": client_id})
-            log.info("Snapcast DeleteClient: %s", client_id)
-            return True
-        except Exception as e:
-            log.error("DeleteClient failed: %s", e)
-            return False
-
     def read_notifications(self) -> list:
         notifications = list(self.pending_notifications)
         self.pending_notifications.clear()
@@ -207,7 +191,6 @@ class SnapcastClient:
         return notifications
 
 
-# ── UART frame receiver ──
 class UARTReceiver:
     SYNC_0_ST, SYNC_1_ST, HEADER_ST, PAYLOAD_ST, CRC_ST = range(5)
 
@@ -261,7 +244,6 @@ class UARTReceiver:
                 self.state = self.SYNC_0_ST
 
 
-# ── Per-client state ──
 class ClientRecord:
     def __init__(self, snap_id: str, name: str):
         self.snap_id        = snap_id
@@ -270,103 +252,65 @@ class ClientRecord:
         self.muted          = False
         self.snap_connected = False
         self.mode           = MODE_SYNC
-        self.powered        = True
+        self.powered        = False
         self.bt_connected   = False
         self.bt_dev_name    = ""
         self.client_ip      = ""
-        self.reachable      = True   # False if control socket can't connect
 
-        self._ctrl_sock: Optional[socket.socket] = None
-        self._ctrl_lock  = threading.Lock()
-        self._connecting = False
+        self._sock: Optional[socket.socket] = None
+        self._sock_lock = threading.Lock()
+        self._last_pong = time.time()
+        self._ping_misses = 0
 
-    def ctrl_connected(self) -> bool:
-        return self._ctrl_sock is not None
-
-    def ctrl_connect(self, on_message_cb):
-        if not self.client_ip:
-            return
-        with self._ctrl_lock:
-            if self._connecting or self._ctrl_sock:
-                return
-            self._connecting = True
-        try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(5)
-            sock.connect((self.client_ip, CTRL_PORT))
-            sock.settimeout(None)
-            sock.setblocking(False)
-            with self._ctrl_lock:
-                self._ctrl_sock = sock
-                self._connecting = False
-            self.reachable = True
-            log.info("Connected to client Pi %s (%s)", self.name, self.client_ip)
-            self._ctrl_recv_loop(on_message_cb)
-        except Exception as e:
-            log.warning("Cannot connect to client Pi %s: %s", self.name, e)
-            self.reachable = False
-            with self._ctrl_lock:
-                self._ctrl_sock = None
-                self._connecting = False
-
-    def _ctrl_recv_loop(self, on_message_cb):
-        with self._ctrl_lock:
-            sock = self._ctrl_sock
-        if not sock:
-            return
-        buf = b""
-        try:
-            while True:
+    def set_sock(self, sock: socket.socket, addr):
+        with self._sock_lock:
+            if self._sock:
                 try:
-                    data = sock.recv(1024)
-                except BlockingIOError:
-                    time.sleep(0.01)
-                    continue
-                if not data:
-                    break
-                buf += data
-                while b"\n" in buf:
-                    line, buf = buf.split(b"\n", 1)
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        msg = json.loads(line)
-                        on_message_cb(self, msg)
-                    except json.JSONDecodeError:
-                        pass
-        except Exception as e:
-            log.warning("Client Pi %s ctrl recv error: %s", self.name, e)
-        finally:
-            self.reachable = False
-            with self._ctrl_lock:
-                self._ctrl_sock = None
-            log.info("Client Pi %s control socket closed", self.name)
+                    self._sock.close()
+                except Exception:
+                    pass
+            self._sock = sock
+            self.client_ip = addr[0]
+            self._last_pong = time.time()
+            self._ping_misses = 0
 
     def ctrl_send(self, msg: dict):
-        with self._ctrl_lock:
-            sock = self._ctrl_sock
+        with self._sock_lock:
+            sock = self._sock
         if not sock:
             return
         try:
             sock.sendall((json.dumps(msg) + "\n").encode())
         except Exception as e:
             log.warning("ctrl_send to %s failed: %s", self.name, e)
-            with self._ctrl_lock:
-                self._ctrl_sock = None
+            with self._sock_lock:
+                self._sock = None
 
-    def ensure_connected(self, on_message_cb):
-        with self._ctrl_lock:
-            if self._ctrl_sock or self._connecting or not self.client_ip:
-                return
-        threading.Thread(
-            target=self.ctrl_connect,
-            args=(on_message_cb,),
-            daemon=True,
-        ).start()
+    def disconnect(self):
+        with self._sock_lock:
+            if self._sock:
+                try:
+                    self._sock.close()
+                except Exception:
+                    pass
+                self._sock = None
+
+    def connected(self) -> bool:
+        with self._sock_lock:
+            return self._sock is not None
+
+    def record_pong(self):
+        self._last_pong = time.time()
+        self._ping_misses = 0
+
+    def tick_ping(self) -> bool:
+        if time.time() - self._last_pong > PING_INTERVAL_S:
+            self._ping_misses += 1
+            if self._ping_misses >= PING_MISS_MAX:
+                return True
+        return False
 
 
-# ── Password helpers ──
 def sha256_hex(plaintext: str) -> str:
     return hashlib.sha256(plaintext.encode()).hexdigest()
 
@@ -397,11 +341,9 @@ def _broadcast_hash_to_one(ip: str, h: str):
         log.warning("PW broadcast failed for %s: %s", ip, e)
 
 
-# ── Main server bridge ──
 class ServerBridge:
     ESP_TIMEOUT_S          = 20
     SNAP_HEALTH_INTERVAL_S = 10
-    CTRL_RECONNECT_S       = 10
 
     def __init__(self, serial_port, baud, snap_host, snap_port):
         self.ser  = serial.Serial(serial_port, baud, timeout=0.05)
@@ -410,13 +352,10 @@ class ServerBridge:
 
         self._clients: dict[str, ClientRecord] = {}
         self._clients_lock = threading.Lock()
-        self._clients_by_name: dict[str, str] = {}
-        self._known_snap_ids: set[str] = set()
 
         self._esp_connected        = False
         self._last_esp_msg_time    = time.time()
         self._last_snap_health     = time.time()
-        self._last_ctrl_reconnect  = time.time()
         self._esp_vol_set_time     = {}
         self._running              = True
 
@@ -424,60 +363,164 @@ class ServerBridge:
         self._hash_pull_server = HashPullServer(lambda: self._pw_hash)
         self._hash_pull_server.start()
 
-    # ────────────────────────────────────────────
-    # UDP discovery broadcaster
-    # ────────────────────────────────────────────
-    def _discovery_thread(self):
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-        sock.settimeout(1.0)
-        log.info("UDP discovery broadcaster started")
-        discover_msg = json.dumps({"type": "discover"}).encode()
-
+    # ── Registration listener ──
+    def _registration_listener(self):
+        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind(("0.0.0.0", CTRL_PORT))
+        srv.listen(24)
+        log.info("Registration listener on port %d", CTRL_PORT)
         while True:
             try:
-                sock.sendto(discover_msg, ("255.255.255.255", DISCOVERY_PORT))
+                conn, addr = srv.accept()
+                conn.setblocking(False)
+                log.info("Inbound connection from %s", addr[0])
+                threading.Thread(
+                    target=self._client_session,
+                    args=(conn, addr),
+                    daemon=True,
+                ).start()
             except Exception as e:
-                log.warning("Discovery broadcast error: %s", e)
+                log.error("Registration listener error: %s", e)
 
-            deadline = time.time() + DISCOVERY_INTERVAL_S
-            while time.time() < deadline:
-                try:
-                    data, addr = sock.recvfrom(512)
-                    try:
-                        msg = json.loads(data.decode())
-                    except Exception:
-                        continue
-                    if msg.get("type") == "announce":
-                        ip   = msg.get("ip", addr[0])
-                        name = msg.get("name", "")
-                        log.info("Discovery: %s at %s", name, ip)
-                        self._on_client_discovered(name, ip)
-                except socket.timeout:
-                    continue
-                except Exception as e:
-                    log.error("Discovery recv error: %s", e)
+    def _client_session(self, sock: socket.socket, addr):
+        buf = b""
+        rec: Optional[ClientRecord] = None
 
-    def _on_client_discovered(self, name: str, ip: str):
+        sock.settimeout(10)
+        try:
+            while b"\n" not in buf:
+                chunk = sock.recv(1024)
+                if not chunk:
+                    return
+                buf += chunk
+        except Exception:
+            log.warning("No register message from %s — dropping", addr[0])
+            sock.close()
+            return
+
+        sock.settimeout(None)
+        sock.setblocking(False)
+
+        line, buf = buf.split(b"\n", 1)
+        try:
+            msg = json.loads(line.strip())
+        except json.JSONDecodeError:
+            log.warning("Bad register JSON from %s", addr[0])
+            sock.close()
+            return
+
+        if msg.get("type") != "register":
+            log.warning("First message from %s was not register", addr[0])
+            sock.close()
+            return
+
+        snap_id = msg.get("snap_id", "")[:CLIENT_ID_LEN]
+        name    = msg.get("name", addr[0])
+
+        if not snap_id:
+            # snap_id not known yet — match by name, create placeholder
+            snap_id = name  # temporary until state update provides real snap_id
+
         with self._clients_lock:
-            matched = None
-            for rec in self._clients.values():
-                if rec.name.lower() == name.lower():
-                    matched = rec
-                    break
-            if matched:
-                if matched.client_ip != ip:
-                    log.info("Updated IP for %s: %s -> %s", name, matched.client_ip, ip)
-                    matched.client_ip = ip
+            rec = self._clients.get(snap_id)
+            if rec is None:
+                rec = ClientRecord(snap_id, name)
+                self._clients[snap_id] = rec
+                log.info("New client registered: %s (%s)", name, snap_id)
             else:
-                self._clients_by_name[name] = ip
-                return
-        matched.ensure_connected(self._on_ctrl_message)
+                log.info("Client re-registered: %s (%s)", name, snap_id)
 
-    # ────────────────────────────────────────────
-    # UART helpers
-    # ────────────────────────────────────────────
+        rec.set_sock(sock, addr)
+        rec.name           = name
+        rec.mode           = msg.get("mode",           MODE_SYNC)
+        rec.volume         = msg.get("volume",         0)
+        rec.muted          = msg.get("muted",          False)
+        rec.snap_connected = msg.get("snap_connected", False)
+        rec.bt_connected   = msg.get("bt_connected",   False)
+        rec.powered        = msg.get("powered",        False)
+
+        log.info("Registered %s: mode=%d vol=%d powered=%s",
+                 name, rec.mode, rec.volume, rec.powered)
+
+        if self._esp_connected:
+            self._send_client_list()
+            threading.Thread(
+                target=self._send_single_state,
+                args=(rec,),
+                daemon=True,
+            ).start()
+
+        try:
+            while True:
+                try:
+                    data = sock.recv(1024)
+                except BlockingIOError:
+                    time.sleep(0.01)
+                    continue
+                if not data:
+                    break
+                buf += data
+                while b"\n" in buf:
+                    line, buf = buf.split(b"\n", 1)
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        m = json.loads(line)
+                        self._on_ctrl_message(rec, m)
+                    except json.JSONDecodeError:
+                        pass
+        except Exception as e:
+            log.warning("Client %s session error: %s", rec.name, e)
+        finally:
+            rec.disconnect()
+            self._on_client_gone(rec)
+
+    def _send_single_state(self, rec: ClientRecord):
+        time.sleep(0.3)
+        if not self._esp_connected:
+            return
+        payload = self._id_bytes(rec.snap_id) + bytes([
+            rec.mode,
+            1 if rec.snap_connected else 0,
+            1 if rec.bt_connected   else 0,
+            rec.volume,
+        ])
+        self.send_frame(MSG_STATE_UPDATE, payload)
+        self.send_frame(MSG_POWER_STATE,
+                        self._id_bytes(rec.snap_id) + bytes([1 if rec.powered else 0]))
+
+    def _on_client_gone(self, rec: ClientRecord):
+        log.info("Client gone: %s (%s)", rec.name, rec.snap_id)
+        with self._clients_lock:
+            self._clients.pop(rec.snap_id, None)
+        if self._esp_connected:
+            self._send_client_list()
+
+    # ── Ping/pong keepalive ──
+    def _keepalive_thread(self):
+        while True:
+            time.sleep(PING_INTERVAL_S)
+            with self._clients_lock:
+                records = list(self._clients.values())
+
+            dead = []
+            for rec in records:
+                if not rec.connected():
+                    continue
+                if rec.tick_ping():
+                    log.warning("Client %s missed %d pings — removing",
+                                rec.name, PING_MISS_MAX)
+                    dead.append(rec)
+                else:
+                    rec.ctrl_send({"type": "ping"})
+
+            for rec in dead:
+                rec.disconnect()
+                self._on_client_gone(rec)
+
+    # ── UART helpers ──
     def send_frame(self, msg_type: int, payload: bytes = b""):
         frame = build_frame(msg_type, payload)
         self.ser.write(frame)
@@ -486,9 +529,7 @@ class ServerBridge:
     def _id_bytes(self, snap_id: str) -> bytes:
         return snap_id.encode("ascii")[:CLIENT_ID_LEN].ljust(CLIENT_ID_LEN, b"\x00")
 
-    # ────────────────────────────────────────────
-    # Build CLIENT_LIST payload
-    # ────────────────────────────────────────────
+    # ── CLIENT_LIST ──
     def _build_client_list_payload(self) -> bytes:
         with self._clients_lock:
             records = list(self._clients.values())
@@ -516,12 +557,28 @@ class ServerBridge:
         payload = self._build_client_list_payload()
         self.send_frame(MSG_CLIENT_LIST, payload)
         log.info("Sent CLIENT_LIST with %d clients", payload[0])
+        threading.Thread(target=self._resend_all_states, daemon=True).start()
 
-    # ────────────────────────────────────────────
-    # Snapcast status → ClientRecord map
-    # ────────────────────────────────────────────
+    def _resend_all_states(self):
+        time.sleep(0.3)
+        with self._clients_lock:
+            records = list(self._clients.values())
+        for rec in records:
+            if not self._esp_connected:
+                return
+            payload = self._id_bytes(rec.snap_id) + bytes([
+                rec.mode,
+                1 if rec.snap_connected else 0,
+                1 if rec.bt_connected   else 0,
+                rec.volume,
+            ])
+            self.send_frame(MSG_STATE_UPDATE, payload)
+            self.send_frame(MSG_POWER_STATE,
+                            self._id_bytes(rec.snap_id) + bytes([1 if rec.powered else 0]))
+
+    # ── Snapcast status ──
     def _update_from_snap_status(self, status: dict) -> bool:
-        set_changed = False
+        changed = False
         with self._clients_lock:
             for group in status.get("server", {}).get("groups", []):
                 for c in group.get("clients", []):
@@ -536,56 +593,61 @@ class ServerBridge:
                     volume    = vol_info.get("percent", 0)
                     muted     = vol_info.get("muted", False)
                     connected = c.get("connected", False)
-                    ip        = host.get("ip", "")
 
-                    if snap_id not in self._clients:
-                        rec = ClientRecord(snap_id, name)
-                        self._clients[snap_id] = rec
-                        self._known_snap_ids.add(snap_id)
-                        set_changed = True
-                        log.info("New client: %s (%s)", name, snap_id)
-                        cached_ip = self._clients_by_name.pop(name, None)
-                        if cached_ip:
-                            rec.client_ip = cached_ip
-                        elif ip:
-                            rec.client_ip = ip
-                    else:
-                        rec = self._clients[snap_id]
+                    rec = self._clients.get(snap_id)
+                    if rec is None:
+                        # try match by name for clients that registered before snap_id resolved
+                        for r in self._clients.values():
+                            if r.name.lower() == name.lower() and r.snap_id == r.name:
+                                # placeholder — update snap_id
+                                old_id = r.snap_id
+                                self._clients.pop(old_id, None)
+                                r.snap_id = snap_id
+                                self._clients[snap_id] = r
+                                rec = r
+                                log.info("Resolved snap_id for %s: %s", name, snap_id)
+                                break
+                        if rec is None:
+                            continue
 
                     rec.name           = name
                     rec.muted          = muted
+                    if rec.snap_connected != connected:
+                        changed = True
                     rec.snap_connected = connected
-                    if ip and not rec.client_ip:
-                        rec.client_ip = ip
                     if rec.mode == MODE_SYNC:
                         rec.volume = volume
+        return changed
 
-        return set_changed
-
-    # ────────────────────────────────────────────
-    # Control message handler from client Pi
-    # ────────────────────────────────────────────
+    # ── Control message handler ──
     def _on_ctrl_message(self, rec: ClientRecord, msg: dict):
         mtype = msg.get("type", "")
 
+        if mtype == "pong":
+            rec.record_pong()
+            return
+
         if mtype == "state":
+            new_snap_id = msg.get("snap_id", "")
+            if new_snap_id and new_snap_id != rec.snap_id and len(new_snap_id) == CLIENT_ID_LEN:
+                # Client resolved its snap_id — update our dict
+                with self._clients_lock:
+                    self._clients.pop(rec.snap_id, None)
+                    rec.snap_id = new_snap_id
+                    self._clients[new_snap_id] = rec
+                log.info("snap_id resolved for %s: %s", rec.name, new_snap_id)
+
             rec.mode           = msg.get("mode",           rec.mode)
             rec.volume         = msg.get("volume",         rec.volume)
             rec.snap_connected = msg.get("snap_connected", rec.snap_connected)
             rec.bt_connected   = msg.get("bt_connected",   rec.bt_connected)
             rec.bt_dev_name    = msg.get("bt_dev_name",    "")
             rec.powered        = msg.get("powered",        rec.powered)
-            rec.reachable      = True
             new_name = msg.get("client_name", "")
             if new_name:
                 rec.name = new_name
 
-            log.info("State from %s: mode=%d snap=%s bt=%s vol=%d powered=%s",
-                     rec.name, rec.mode, rec.snap_connected,
-                     rec.bt_connected, rec.volume, rec.powered)
-
             if self._esp_connected:
-                # Send state update
                 payload = self._id_bytes(rec.snap_id) + bytes([
                     rec.mode,
                     1 if rec.snap_connected else 0,
@@ -593,48 +655,21 @@ class ServerBridge:
                     rec.volume,
                 ])
                 self.send_frame(MSG_STATE_UPDATE, payload)
-
-                # Send power state
                 self.send_frame(MSG_POWER_STATE,
                                 self._id_bytes(rec.snap_id) + bytes([1 if rec.powered else 0]))
 
         elif mtype == "switching":
             if self._esp_connected:
                 self.send_frame(MSG_MODE_SWITCHING, self._id_bytes(rec.snap_id))
-                log.info("Forwarded MODE_SWITCHING for %s to server ESP", rec.name)
 
         elif mtype == "power_state":
-            # Client reports its powered state after completing GPIO sequence
             powered = msg.get("powered", rec.powered)
             rec.powered = powered
-            log.info("Power state from %s: powered=%s", rec.name, powered)
             if self._esp_connected:
                 self.send_frame(MSG_POWER_STATE,
                                 self._id_bytes(rec.snap_id) + bytes([1 if powered else 0]))
 
-        elif mtype == "pong":
-            pass
-
-    # ────────────────────────────────────────────
-    # Ensure control connections
-    # ────────────────────────────────────────────
-    def _ensure_ctrl_connections(self):
-        with self._clients_lock:
-            records = list(self._clients.values())
-        for rec in records:
-            rec.ensure_connected(self._on_ctrl_message)
-            # Update reachability — if no IP and not connected, mark unreachable
-            if not rec.client_ip and not rec.ctrl_connected():
-                if rec.reachable:
-                    rec.reachable = False
-                    if self._esp_connected:
-                        # Send power state with unreachable flag via powered=False
-                        self.send_frame(MSG_POWER_STATE,
-                                        self._id_bytes(rec.snap_id) + bytes([0xFF]))  # 0xFF = unreachable
-
-    # ────────────────────────────────────────────
-    # ESP message handlers
-    # ────────────────────────────────────────────
+    # ── ESP message handlers ──
     def handle_esp_message(self, msg_type: int, payload: bytes):
         self._last_esp_msg_time = time.time()
 
@@ -659,7 +694,6 @@ class ServerBridge:
                 return
             snap_id = payload[:CLIENT_ID_LEN].rstrip(b"\x00").decode("ascii", errors="replace")
             volume  = payload[CLIENT_ID_LEN]
-            log.info("VOL_SET: %s -> %d", snap_id, volume)
             self._esp_vol_set_time[snap_id] = time.time()
             with self._clients_lock:
                 rec = self._clients.get(snap_id)
@@ -672,7 +706,7 @@ class ServerBridge:
                         self._snap_reconnect()
                     except Exception as e:
                         log.error("VOL_SET snap failed: %s", e)
-                if rec.ctrl_connected():
+                if rec.connected():
                     rec.ctrl_send({"type": "set_volume", "volume": volume})
 
         elif msg_type in (MSG_MODE_SYNC, MSG_MODE_BT):
@@ -680,10 +714,9 @@ class ServerBridge:
                 return
             snap_id  = payload[:CLIENT_ID_LEN].rstrip(b"\x00").decode("ascii", errors="replace")
             new_mode = MODE_SYNC if msg_type == MSG_MODE_SYNC else MODE_BT
-            log.info("Mode switch for %s -> %d", snap_id, new_mode)
             with self._clients_lock:
                 rec = self._clients.get(snap_id)
-            if rec and rec.ctrl_connected():
+            if rec and rec.connected():
                 rec.ctrl_send({"type": "set_mode", "mode": new_mode})
             else:
                 log.warning("No control connection to %s", snap_id)
@@ -693,25 +726,17 @@ class ServerBridge:
                 return
             snap_id = payload[:CLIENT_ID_LEN].rstrip(b"\x00").decode("ascii", errors="replace")
             powered = payload[CLIENT_ID_LEN] != 0
-            log.info("POWER_SET: %s -> %s", snap_id, powered)
             with self._clients_lock:
                 rec = self._clients.get(snap_id)
-            if rec and rec.ctrl_connected():
+            if rec and rec.connected():
                 rec.ctrl_send({"type": "set_powered", "powered": powered})
             else:
-                log.warning("No control connection to %s — cannot set power", snap_id)
-
-        elif msg_type == MSG_REMOVE_CLIENT:
-            if len(payload) < CLIENT_ID_LEN:
-                return
-            snap_id = payload[:CLIENT_ID_LEN].rstrip(b"\x00").decode("ascii", errors="replace")
-            log.info("REMOVE_CLIENT: %s", snap_id)
-            self._handle_remove_client(snap_id)
+                log.warning("No control connection to %s", snap_id)
 
         elif msg_type == MSG_RESTART_SERVER:
             log.info("ESP requested snapserver restart")
             threading.Thread(target=self._restart_snapserver, daemon=True).start()
-            
+
         elif msg_type == MSG_PW_SET:
             raw = payload.rstrip(b"\x00").decode("utf-8", errors="replace")
             if not raw:
@@ -722,70 +747,20 @@ class ServerBridge:
             self._pw_user_set = True
             self.send_frame(MSG_PW_ACK, bytes([1]))
             log.info("Password updated")
-            try:
-                status = self.snap.get_status()
-                for group in status.get("server", {}).get("groups", []):
-                    for c in group.get("clients", []):
-                        ip = c.get("host", {}).get("ip", "")
-                        if ip:
-                            threading.Thread(
-                                target=_broadcast_hash_to_one,
-                                args=(ip, new_hash),
-                                daemon=True,
-                            ).start()
-            except Exception as e:
-                log.error("PW broadcast failed: %s", e)
+            with self._clients_lock:
+                records = list(self._clients.values())
+            for rec in records:
+                if rec.client_ip:
+                    threading.Thread(
+                        target=_broadcast_hash_to_one,
+                        args=(rec.client_ip, new_hash),
+                        daemon=True,
+                    ).start()
 
         else:
             log.warning("Unknown ESP msg: 0x%02X", msg_type)
 
-    # ────────────────────────────────────────────
-    # Restart Snapserver
-    # ────────────────────────────────────────────
-    def _restart_snapserver(self):
-        log.info("Restarting snapserver...")
-        try:
-            subprocess.run(["sudo", "systemctl", "restart", "snapserver"],
-                        timeout=15, check=False)
-            log.info("Snapserver restarted — waiting for it to come back")
-            time.sleep(4)
-            self.snap.connect()
-            status = self.snap.get_status()
-            if status:
-                self._update_from_snap_status(status)
-                if self._esp_connected:
-                    self._send_client_list()
-        except Exception as e:
-            log.error("Snapserver restart failed: %s", e)
-            
-    # ────────────────────────────────────────────
-    # Remove client
-    # ────────────────────────────────────────────
-    def _handle_remove_client(self, snap_id: str):
-        # Remove from Snapcast
-        try:
-            self.snap.delete_client(snap_id)
-        except Exception as e:
-            log.error("Snapcast delete_client failed: %s", e)
-
-        # Remove from our map
-        with self._clients_lock:
-            rec = self._clients.pop(snap_id, None)
-            self._known_snap_ids.discard(snap_id)
-
-        if rec:
-            # Close control socket if open
-            rec.ctrl_send({"type": "removed"})  # notify client Pi
-            log.info("Removed client %s (%s)", rec.name, snap_id)
-
-        # Tell ESP the client was removed and send updated list
-        if self._esp_connected:
-            self.send_frame(MSG_CLIENT_REMOVED, self._id_bytes(snap_id))
-            self._send_client_list()
-
-    # ────────────────────────────────────────────
-    # Snapcast notification handler
-    # ────────────────────────────────────────────
+    # ── Snapcast notification handler ──
     def handle_snap_notification(self, notification: dict):
         method = notification.get("method", "")
         relevant = {
@@ -794,8 +769,6 @@ class ServerBridge:
         }
         if method not in relevant and method != "Client.OnVolumeChanged":
             return
-
-        log.info("Snapcast event: %s", method)
 
         if method == "Client.OnVolumeChanged":
             params   = notification.get("params", {})
@@ -817,15 +790,27 @@ class ServerBridge:
             time.sleep(0.5)
             try:
                 status = self.snap.get_status()
-                set_changed = self._update_from_snap_status(status)
-                if set_changed and self._esp_connected:
-                    self._send_client_list()
+                self._update_from_snap_status(status)
             except Exception as e:
                 log.error("Snap refresh failed: %s", e)
 
-    # ────────────────────────────────────────────
-    # Snap reconnect
-    # ────────────────────────────────────────────
+    # ── Restart Snapserver ──
+    def _restart_snapserver(self):
+        log.info("Restarting snapserver...")
+        try:
+            subprocess.run(["sudo", "systemctl", "restart", "snapserver"],
+                           timeout=15, check=False)
+            time.sleep(4)
+            self.snap.connect()
+            status = self.snap.get_status()
+            if status:
+                self._update_from_snap_status(status)
+                if self._esp_connected:
+                    self._send_client_list()
+        except Exception as e:
+            log.error("Snapserver restart failed: %s", e)
+
+    # ── Snap reconnect ──
     def _snap_reconnect(self):
         log.error("Snapcast lost")
         try:
@@ -850,13 +835,12 @@ class ServerBridge:
         except Exception as e:
             log.error("Snap reconnect status failed: %s", e)
 
-    # ────────────────────────────────────────────
-    # Main loop
-    # ────────────────────────────────────────────
+    # ── Main loop ──
     def run(self):
         log.info("Server bridge starting — %s @ %d", self.ser.port, self.ser.baudrate)
         self.snap.connect()
-        threading.Thread(target=self._discovery_thread, daemon=True).start()
+        threading.Thread(target=self._registration_listener, daemon=True).start()
+        threading.Thread(target=self._keepalive_thread,      daemon=True).start()
 
         while self._running:
             data = self.ser.read(256)
@@ -875,9 +859,9 @@ class ServerBridge:
                     self._last_snap_health = now
                     try:
                         status = self.snap.get_status()
-                        set_changed = self._update_from_snap_status(status)
-                        if set_changed:
-                            self._send_client_list()
+                        changed = self._update_from_snap_status(status)
+                        if changed:
+                            self._resend_all_states()
                     except (ConnectionError, OSError, TimeoutError):
                         self._snap_reconnect()
                     except Exception as e:
@@ -891,11 +875,6 @@ class ServerBridge:
                     self._snap_reconnect()
                 except Exception as e:
                     log.error("Snap notification error: %s", e)
-
-            now = time.time()
-            if now - self._last_ctrl_reconnect >= self.CTRL_RECONNECT_S:
-                self._last_ctrl_reconnect = now
-                self._ensure_ctrl_connections()
 
 
 def main():
