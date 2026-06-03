@@ -41,9 +41,9 @@ CLIENT_ID_LEN     = 36
 CLIENT_NAME_LEN   = 32
 CLIENT_ENTRY_SIZE = CLIENT_ID_LEN + CLIENT_NAME_LEN + 6
 
-CTRL_PORT        = 7702
-PW_HASH_FILE     = "/etc/zone_password.hash"
-PW_DEFAULT       = "anjay1234"
+CTRL_PORT         = 7702
+PW_HASH_FILE      = "/etc/zone_password.hash"
+PW_DEFAULT        = "anjay1234"
 PW_BROADCAST_PORT = 7700
 
 PING_INTERVAL_S  = 5
@@ -363,7 +363,26 @@ class ServerBridge:
         self._hash_pull_server = HashPullServer(lambda: self._pw_hash)
         self._hash_pull_server.start()
 
-    # ── Registration listener ──
+    # ── Client lookup — by snap_id first, then name fallback ──────────────
+    def _find_client(self, snap_id: str) -> Optional[ClientRecord]:
+        """
+        Look up a client by snap_id. Falls back to name match so commands
+        from the ESP still work during the window before Snapcast resolves
+        the real snap_id (MAC address).
+        """
+        with self._clients_lock:
+            rec = self._clients.get(snap_id)
+            if rec:
+                return rec
+            # Fallback: match by name (snap_id sent by ESP may still be the
+            # hostname placeholder used before Snapcast resolution)
+            name_lower = snap_id.lower()
+            for r in self._clients.values():
+                if r.name.lower() == name_lower:
+                    return r
+        return None
+
+    # ── Registration listener ──────────────────────────────────────────────
     def _registration_listener(self):
         srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -419,11 +438,22 @@ class ServerBridge:
         name    = msg.get("name", addr[0])
 
         if not snap_id:
-            # snap_id not known yet — match by name, create placeholder
-            snap_id = name  # temporary until state update provides real snap_id
+            snap_id = name  # placeholder until Snapcast resolves real snap_id
 
         with self._clients_lock:
             rec = self._clients.get(snap_id)
+            if rec is None:
+                # Also check by name in case it was registered under a different key
+                for r in self._clients.values():
+                    if r.name.lower() == name.lower():
+                        rec = r
+                        # Re-key under new snap_id if different
+                        if rec.snap_id != snap_id:
+                            old_id = rec.snap_id
+                            self._clients.pop(old_id, None)
+                            rec.snap_id = snap_id
+                            self._clients[snap_id] = rec
+                        break
             if rec is None:
                 rec = ClientRecord(snap_id, name)
                 self._clients[snap_id] = rec
@@ -498,7 +528,7 @@ class ServerBridge:
         if self._esp_connected:
             self._send_client_list()
 
-    # ── Ping/pong keepalive ──
+    # ── Ping/pong keepalive ───────────────────────────────────────────────
     def _keepalive_thread(self):
         while True:
             time.sleep(PING_INTERVAL_S)
@@ -520,7 +550,7 @@ class ServerBridge:
                 rec.disconnect()
                 self._on_client_gone(rec)
 
-    # ── UART helpers ──
+    # ── UART helpers ──────────────────────────────────────────────────────
     def send_frame(self, msg_type: int, payload: bytes = b""):
         frame = build_frame(msg_type, payload)
         self.ser.write(frame)
@@ -529,7 +559,7 @@ class ServerBridge:
     def _id_bytes(self, snap_id: str) -> bytes:
         return snap_id.encode("ascii")[:CLIENT_ID_LEN].ljust(CLIENT_ID_LEN, b"\x00")
 
-    # ── CLIENT_LIST ──
+    # ── CLIENT_LIST ───────────────────────────────────────────────────────
     def _build_client_list_payload(self) -> bytes:
         with self._clients_lock:
             records = list(self._clients.values())
@@ -576,7 +606,7 @@ class ServerBridge:
             self.send_frame(MSG_POWER_STATE,
                             self._id_bytes(rec.snap_id) + bytes([1 if rec.powered else 0]))
 
-    # ── Snapcast status ──
+    # ── Snapcast status ───────────────────────────────────────────────────
     def _update_from_snap_status(self, status: dict) -> bool:
         changed = False
         with self._clients_lock:
@@ -596,10 +626,9 @@ class ServerBridge:
 
                     rec = self._clients.get(snap_id)
                     if rec is None:
-                        # try match by name for clients that registered before snap_id resolved
+                        # try match by name for placeholder-registered clients
                         for r in self._clients.values():
                             if r.name.lower() == name.lower() and r.snap_id == r.name:
-                                # placeholder — update snap_id
                                 old_id = r.snap_id
                                 self._clients.pop(old_id, None)
                                 r.snap_id = snap_id
@@ -619,7 +648,7 @@ class ServerBridge:
                         rec.volume = volume
         return changed
 
-    # ── Control message handler ──
+    # ── Control message handler ───────────────────────────────────────────
     def _on_ctrl_message(self, rec: ClientRecord, msg: dict):
         mtype = msg.get("type", "")
 
@@ -630,7 +659,6 @@ class ServerBridge:
         if mtype == "state":
             new_snap_id = msg.get("snap_id", "")
             if new_snap_id and new_snap_id != rec.snap_id and len(new_snap_id) == CLIENT_ID_LEN:
-                # Client resolved its snap_id — update our dict
                 with self._clients_lock:
                     self._clients.pop(rec.snap_id, None)
                     rec.snap_id = new_snap_id
@@ -669,7 +697,7 @@ class ServerBridge:
                 self.send_frame(MSG_POWER_STATE,
                                 self._id_bytes(rec.snap_id) + bytes([1 if powered else 0]))
 
-    # ── ESP message handlers ──
+    # ── ESP message handlers ──────────────────────────────────────────────
     def handle_esp_message(self, msg_type: int, payload: bytes):
         self._last_esp_msg_time = time.time()
 
@@ -695,13 +723,12 @@ class ServerBridge:
             snap_id = payload[:CLIENT_ID_LEN].rstrip(b"\x00").decode("ascii", errors="replace")
             volume  = payload[CLIENT_ID_LEN]
             self._esp_vol_set_time[snap_id] = time.time()
-            with self._clients_lock:
-                rec = self._clients.get(snap_id)
+            rec = self._find_client(snap_id)
             if rec:
                 rec.volume = volume
                 if rec.mode == MODE_SYNC:
                     try:
-                        self.snap.set_volume(snap_id, volume)
+                        self.snap.set_volume(rec.snap_id, volume)
                     except (ConnectionError, OSError):
                         self._snap_reconnect()
                     except Exception as e:
@@ -714,10 +741,10 @@ class ServerBridge:
                 return
             snap_id  = payload[:CLIENT_ID_LEN].rstrip(b"\x00").decode("ascii", errors="replace")
             new_mode = MODE_SYNC if msg_type == MSG_MODE_SYNC else MODE_BT
-            with self._clients_lock:
-                rec = self._clients.get(snap_id)
+            rec = self._find_client(snap_id)
             if rec and rec.connected():
                 rec.ctrl_send({"type": "set_mode", "mode": new_mode})
+                log.info("Mode switch -> %s sent to %s", "SYNC" if new_mode == MODE_SYNC else "BT", rec.name)
             else:
                 log.warning("No control connection to %s", snap_id)
 
@@ -726,10 +753,10 @@ class ServerBridge:
                 return
             snap_id = payload[:CLIENT_ID_LEN].rstrip(b"\x00").decode("ascii", errors="replace")
             powered = payload[CLIENT_ID_LEN] != 0
-            with self._clients_lock:
-                rec = self._clients.get(snap_id)
+            rec = self._find_client(snap_id)
             if rec and rec.connected():
                 rec.ctrl_send({"type": "set_powered", "powered": powered})
+                log.info("Power -> %s sent to %s", powered, rec.name)
             else:
                 log.warning("No control connection to %s", snap_id)
 
@@ -760,7 +787,7 @@ class ServerBridge:
         else:
             log.warning("Unknown ESP msg: 0x%02X", msg_type)
 
-    # ── Snapcast notification handler ──
+    # ── Snapcast notification handler ─────────────────────────────────────
     def handle_snap_notification(self, notification: dict):
         method = notification.get("method", "")
         relevant = {
@@ -777,8 +804,7 @@ class ServerBridge:
             last_set = self._esp_vol_set_time.get(snap_id, 0)
             if time.time() - last_set < 1.0:
                 return
-            with self._clients_lock:
-                rec = self._clients.get(snap_id)
+            rec = self._find_client(snap_id)
             if rec:
                 if rec.mode == MODE_BT:
                     return
@@ -794,7 +820,7 @@ class ServerBridge:
             except Exception as e:
                 log.error("Snap refresh failed: %s", e)
 
-    # ── Restart Snapserver ──
+    # ── Restart Snapserver ────────────────────────────────────────────────
     def _restart_snapserver(self):
         log.info("Restarting snapserver...")
         try:
@@ -810,7 +836,7 @@ class ServerBridge:
         except Exception as e:
             log.error("Snapserver restart failed: %s", e)
 
-    # ── Snap reconnect ──
+    # ── Snap reconnect ────────────────────────────────────────────────────
     def _snap_reconnect(self):
         log.error("Snapcast lost")
         try:
@@ -835,7 +861,7 @@ class ServerBridge:
         except Exception as e:
             log.error("Snap reconnect status failed: %s", e)
 
-    # ── Main loop ──
+    # ── Main loop ─────────────────────────────────────────────────────────
     def run(self):
         log.info("Server bridge starting — %s @ %d", self.ser.port, self.ser.baudrate)
         self.snap.connect()
