@@ -45,12 +45,12 @@ fi
 
 # ── 1. Update package lists ──
 echo ""
-echo "[1/12] Updating package lists..."
+echo "[1/13] Updating package lists..."
 apt update
 
 # ── 2. Install packages (pinned versions) ──
 echo ""
-echo "[2/12] Installing packages..."
+echo "[2/13] Installing packages..."
 apt install -y \
     pulseaudio=16.1+dfsg1-2+rpt1.1 \
     pulseaudio-module-bluetooth=16.1+dfsg1-2+rpt1.1 \
@@ -78,7 +78,7 @@ usermod -a -G gpio "$REAL_USER"
 
 # ── 3. config.txt — UART, I2S, disable onboard BT ──
 echo ""
-echo "[3/12] Configuring /boot/firmware/config.txt..."
+echo "[3/13] Configuring /boot/firmware/config.txt..."
 
 CONFIG="/boot/firmware/config.txt"
 cp "$CONFIG" "${CONFIG}.bak"
@@ -107,11 +107,14 @@ enable_uart=1
 # Disable onboard Bluetooth — using USB dongle only
 dtoverlay=disable-bt
 dtoverlay=dwc2,dr_mode=host
+
+# Enable hardware PWM on GPIO12 for fan control
+dtoverlay=pwm,pin=12,func=4
 CFGEOF
 
 # ── 4. Free UART from serial console ──
 echo ""
-echo "[4/12] Freeing UART from serial console..."
+echo "[4/13] Freeing UART from serial console..."
 
 sed -i 's/console=serial0,[0-9]* //' /boot/firmware/cmdline.txt
 systemctl disable serial-getty@ttyAMA0.service 2>/dev/null || true
@@ -119,7 +122,7 @@ systemctl disable serial-getty@ttyAMA0.service 2>/dev/null || true
 
 # ── 5. Configure PulseAudio — user mode, 96kHz/32-bit ──
 echo ""
-echo "[5/12] Configuring PulseAudio..."
+echo "[5/13] Configuring PulseAudio..."
 
 # Remove any existing custom config to avoid duplicates
 sed -i '/^# Client audio config$/,/^resample-method/d' /etc/pulse/daemon.conf
@@ -156,13 +159,13 @@ loginctl enable-linger "$REAL_USER"
 
 # ── 6. Console autologin ──
 echo ""
-echo "[6/12] Enabling console autologin..."
+echo "[6/13] Enabling console autologin..."
 
 raspi-config nonint do_boot_behaviour B2
 
 # ── 7. Bluetooth — USB dongle, always discoverable, auto-pair, A2DP ──
 echo ""
-echo "[7/12] Configuring Bluetooth..."
+echo "[7/13] Configuring Bluetooth..."
 
 # BlueZ main.conf
 sed -i 's/^#*Class\s*=.*/Class = 0x41C/' /etc/bluetooth/main.conf
@@ -442,7 +445,7 @@ systemctl enable bt-agent.service
 
 # ── 8. Snapclient — 96kHz/32-bit ALSA ──
 echo ""
-echo "[8/12] Configuring Snapclient..."
+echo "[8/13] Configuring Snapclient..."
 
 cat > /etc/default/snapclient << 'EOF'
 START_SNAPCLIENT=true
@@ -453,7 +456,7 @@ systemctl enable snapclient
 
 # ── 9. ESP Bridge ──
 echo ""
-echo "[9/12] Setting up ESP Bridge..."
+echo "[9/13] Setting up ESP Bridge..."
 
 BRIDGE_DIR="/opt/esp-bridge"
 mkdir -p "$BRIDGE_DIR"
@@ -491,9 +494,86 @@ SVCEOF
 systemctl daemon-reload
 systemctl enable esp-bridge.service
 
-# ── 10. Sudo permissions ──
+# ── 10. Fan control service ──
 echo ""
-echo "[10/12] Configuring sudoers..."
+echo "[10/13] Setting up fan control service..."
+ 
+cat > /usr/local/bin/fan_control.sh << 'EOF'
+#!/bin/bash
+# Fan PWM controller — reads /tmp/power_state written by esp-bridge
+# Both GPIO17 (DSP) and GPIO27 (AMP) must be HIGH for fan ON
+ 
+PWM_CHIP="/sys/class/pwm/pwmchip0"
+PWM_CH="0"
+PWM_PATH="$PWM_CHIP/pwm$PWM_CH"
+PERIOD=40000000   # 25Hz
+DUTY_ON=40000000  # 100%
+DUTY_OFF=0
+ 
+# Init PWM
+if [ ! -d "$PWM_PATH" ]; then
+    echo $PWM_CH > "$PWM_CHIP/export"
+    sleep 0.2
+fi
+echo $PERIOD   > "$PWM_PATH/period"
+echo $DUTY_OFF > "$PWM_PATH/duty_cycle"
+echo 1         > "$PWM_PATH/enable"
+echo "Fan PWM initialised"
+ 
+CURRENT=""
+ 
+while true; do
+    if [ -f /tmp/power_state ]; then
+        read DSP AMP < /tmp/power_state
+    else
+        DSP=0; AMP=0
+    fi
+ 
+    if [ "$DSP" = "1" ] && [ "$AMP" = "1" ]; then
+        STATE="on"
+    else
+        STATE="off"
+    fi
+ 
+    if [ "$STATE" != "$CURRENT" ]; then
+        if [ "$STATE" = "on" ]; then
+            echo $DUTY_ON > "$PWM_PATH/duty_cycle"
+            echo "Fan ON (100%)"
+        else
+            echo $DUTY_OFF > "$PWM_PATH/duty_cycle"
+            echo "Fan OFF"
+        fi
+        CURRENT="$STATE"
+    fi
+ 
+    sleep 1
+done
+EOF
+ 
+chmod +x /usr/local/bin/fan_control.sh
+ 
+cat > /etc/systemd/system/fan-control.service << 'EOF'
+[Unit]
+Description=Fan PWM controller (power_state → GPIO12 PWM)
+After=multi-user.target
+ 
+[Service]
+Type=simple
+User=root
+ExecStart=/usr/local/bin/fan_control.sh
+Restart=always
+RestartSec=3
+ 
+[Install]
+WantedBy=multi-user.target
+EOF
+ 
+systemctl daemon-reload
+systemctl enable fan-control.service
+ 
+# ── 11. Sudo permissions ──
+echo ""
+echo "[11/13] Configuring sudoers..."
 
 cat > /etc/sudoers.d/esp-bridge << SUDOEOF
 $REAL_USER ALL=(ALL) NOPASSWD: /bin/systemctl start snapclient
@@ -502,14 +582,14 @@ $REAL_USER ALL=(ALL) NOPASSWD: /usr/bin/hostnamectl set-hostname *
 SUDOEOF
 chmod 440 /etc/sudoers.d/esp-bridge
 
-# ── 11. Enable user linger (already done above, ensure it's set) ──
+# ── 12. Enable user linger (already done above, ensure it's set) ──
 echo ""
-echo "[11/12] Enabling user linger..."
+echo "[12/13] Enabling user linger..."
 loginctl enable-linger "$REAL_USER"
 
-# ── 12. Avahi mDNS — IPv4 only ──
+# ── 13. Avahi mDNS — IPv4 only ──
 echo ""
-echo "[12/12] Configuring Avahi for IPv4 only..."
+echo "[13/13] Configuring Avahi for IPv4 only..."
 
 if grep -q "^use-ipv6" /etc/avahi/avahi-daemon.conf; then
     sed -i 's/^#*use-ipv6\s*=.*/use-ipv6=no/' /etc/avahi/avahi-daemon.conf
@@ -547,11 +627,13 @@ echo "   - bt-init (USB dongle init)"
 echo "   - bt-agent (Python DBus auto-pair, no PIN, auto-removes on disconnect)"
 echo "   - snapclient (multiroom audio, sync mode)"
 echo "   - esp-bridge (ESP32 UART communication)"
+echo "   - fan-control (GPIO12 PWM fan via power_state file)"
 echo ""
 echo " Key behaviors:"
 echo "   - Sync mode: PulseAudio OFF, snapclient ON (ALSA direct at 96kHz)"
 echo "   - BT mode:   PulseAudio ON, snapclient OFF, loopback loaded by bridge"
 echo "   - BT agent auto-pairs any device, removes bonding on disconnect"
+echo "   - Fan ON (100%) when both DSP+AMP powered, OFF otherwise"
 echo ""
 echo " Config files:"
 echo "   /etc/pulse/daemon.conf"
