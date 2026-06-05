@@ -24,6 +24,8 @@ MSG_MODE_SYNC       = 0x05
 MSG_MODE_BT         = 0x06
 MSG_POWER_SET       = 0x07
 MSG_RESTART_SERVER  = 0x09
+MSG_INPUT_SET       = 0x0A   # 0=usb, 1=mic
+MSG_INPUT_SET       = 0x0A   # 0=usb, 1=mic
 MSG_ACK             = 0x10
 MSG_CLIENT_LIST     = 0x11
 MSG_CLIENT_VOL_UPD  = 0x12
@@ -358,6 +360,8 @@ class ServerBridge:
         self._last_snap_health     = time.time()
         self._esp_vol_set_time     = {}
         self._running              = True
+        self._input_mode           = 0  # 0=usb 1=mic; default usb, both services start disabled
+        self._input_mode           = 0  # 0=usb, 1=mic
 
         self._pw_hash, self._pw_user_set = load_or_init_password()
         self._hash_pull_server = HashPullServer(lambda: self._pw_hash)
@@ -713,6 +717,12 @@ class ServerBridge:
                 log.error("Snap status on INIT failed: %s", e)
             self._send_client_list()
             self.send_frame(MSG_PW_ACK, bytes([1 if self._pw_user_set else 0]))
+            # On ESP connect, start whichever input was last active
+            threading.Thread(
+                target=self._apply_input_mode,
+                args=(self._input_mode,),
+                daemon=True,
+            ).start()
 
         elif msg_type == MSG_PING:
             self.send_frame(MSG_PONG)
@@ -759,6 +769,30 @@ class ServerBridge:
                 log.info("Power -> %s sent to %s", powered, rec.name)
             else:
                 log.warning("No control connection to %s", snap_id)
+
+        elif msg_type == MSG_INPUT_SET:
+            if len(payload) < 1:
+                return
+            mode = payload[0]  # 0=usb, 1=mic
+            self._input_mode = mode
+            log.info("Input mode set: %s", "mic" if mode else "usb")
+            threading.Thread(
+                target=self._apply_input_mode,
+                args=(mode,),
+                daemon=True,
+            ).start()
+
+        elif msg_type == MSG_INPUT_SET:
+            if len(payload) < 1:
+                return
+            mode = payload[0]  # 0=usb, 1=mic
+            self._input_mode = mode
+            log.info("Input mode set: %s", "mic" if mode else "usb")
+            threading.Thread(
+                target=self._apply_input_mode,
+                args=(mode,),
+                daemon=True,
+            ).start()
 
         elif msg_type == MSG_RESTART_SERVER:
             log.info("ESP requested snapserver restart")
@@ -819,6 +853,51 @@ class ServerBridge:
                 self._update_from_snap_status(status)
             except Exception as e:
                 log.error("Snap refresh failed: %s", e)
+
+    # ── Input mode switch ────────────────────────────────────────────────
+    def _apply_input_mode(self, mode: int):
+        """Switch audio input: 0=USB/UAC, 1=mic."""
+        try:
+            if mode == 0:
+                subprocess.run(["sudo", "systemctl", "stop",  "snapcast-sourcemic"],
+                               timeout=5, check=False, capture_output=True)
+                subprocess.run(["sudo", "systemctl", "start", "snapcast-source"],
+                               timeout=5, check=False, capture_output=True)
+                log.info("Input switched to USB/UAC")
+            else:
+                subprocess.run(["sudo", "systemctl", "stop",  "snapcast-source"],
+                               timeout=5, check=False, capture_output=True)
+                subprocess.run(["sudo", "systemctl", "start", "snapcast-sourcemic"],
+                               timeout=5, check=False, capture_output=True)
+                log.info("Input switched to mic")
+        except Exception as e:
+            log.error("Input mode switch failed: %s", e)
+
+    # ── Input mode switch ────────────────────────────────────────────────
+    def _apply_input_mode(self, mode: int):
+        """
+        Switch audio input source.
+        mode=0 (USB/UAC): stop snapcast-sourcemic, start snapcast-source.
+        mode=1 (mic):     stop snapcast-source,    start snapcast-sourcemic.
+        Both services are disabled at boot — this is the only thing that starts them.
+        """
+        try:
+            if mode == 0:
+                log.info("Switching input to USB/UAC")
+                subprocess.run(["sudo", "systemctl", "stop",  "snapcast-sourcemic"],
+                               timeout=10, check=False, capture_output=True)
+                subprocess.run(["sudo", "systemctl", "start", "snapcast-source"],
+                               timeout=10, check=False, capture_output=True)
+                log.info("Input: USB/UAC active")
+            else:
+                log.info("Switching input to mic")
+                subprocess.run(["sudo", "systemctl", "stop",  "snapcast-source"],
+                               timeout=10, check=False, capture_output=True)
+                subprocess.run(["sudo", "systemctl", "start", "snapcast-sourcemic"],
+                               timeout=10, check=False, capture_output=True)
+                log.info("Input: mic active")
+        except Exception as e:
+            log.error("Input mode switch failed: %s", e)
 
     # ── Restart Snapserver ────────────────────────────────────────────────
     def _restart_snapserver(self):
