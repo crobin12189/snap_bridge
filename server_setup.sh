@@ -166,36 +166,81 @@ systemctl disable serial-getty@ttyAMA0.service 2>/dev/null || true
 echo ""
 echo "[6/9] Creating audio capture service..."
 
+# UAC source service — dynamically finds platform USB source (UAC gadget)
+# Disabled at boot — server_bridge starts it based on input mode
 cat > /etc/systemd/system/snapcast-source.service << SVCEOF
 [Unit]
-Description=PipeWire audio source to Snapcast FIFO
+Description=PipeWire UAC audio source to Snapcast FIFO
 After=pipewire.service snapserver.service
 Wants=pipewire.service
-
+ 
 [Service]
 Type=simple
 User=$REAL_USER
 Environment=XDG_RUNTIME_DIR=/run/user/$USER_ID
-ExecStartPre=/bin/sleep 5
 ExecStartPre=/bin/bash -c 'test -p /tmp/snapfifo || mkfifo /tmp/snapfifo'
 ExecStart=/bin/bash -c '\\
     while true; do \\
-        parec \\
-            --device=alsa_input.platform-3f980000.usb.stereo-fallback \\
-            --format=s32le \\
-            --rate=96000 \\
-            --channels=2 \\
-            --latency-msec=10 \\
-            --process-time-msec=5 \\
-        > /tmp/snapfifo || true; \\
-        sleep 0.5; \\
+        DEVICE=\$(pactl list sources short | grep "alsa_input.platform-.*usb" | awk "{print \\\$2}" | head -1); \\
+        if [ -n "\$DEVICE" ]; then \\
+            parec \\
+                --device=\$DEVICE \\
+                --format=s32le \\
+                --rate=96000 \\
+                --channels=2 \\
+                --latency-msec=10 \\
+                --process-time-msec=5 \\
+            > /tmp/snapfifo || true; \\
+        else \\
+            sleep 1; \\
+        fi; \\
     done'
 Restart=always
 RestartSec=2
-
+ 
 [Install]
 WantedBy=multi-user.target
 SVCEOF
+ 
+# Mic source service — dynamically finds USB mic (non-platform source)
+# Disabled at boot — server_bridge starts it based on input mode
+cat > /etc/systemd/system/snapcast-sourcemic.service << SVCEOF
+[Unit]
+Description=PipeWire mic audio source to Snapcast FIFO
+After=pipewire.service snapserver.service
+Wants=pipewire.service
+ 
+[Service]
+Type=simple
+User=$REAL_USER
+Environment=XDG_RUNTIME_DIR=/run/user/$USER_ID
+ExecStartPre=/bin/bash -c 'test -p /tmp/snapfifo || mkfifo /tmp/snapfifo'
+ExecStart=/bin/bash -c '\\
+    while true; do \\
+        DEVICE=\$(pactl list sources short | grep alsa_input | grep -v monitor | grep -v "platform-" | awk "{print \\\$2}" | head -1); \\
+        if [ -n "\$DEVICE" ]; then \\
+            parec \\
+                --device=\$DEVICE \\
+                --format=s32le \\
+                --rate=96000 \\
+                --channels=2 \\
+                --latency-msec=10 \\
+                --process-time-msec=5 \\
+            > /tmp/snapfifo || true; \\
+        else \\
+            sleep 1; \\
+        fi; \\
+    done'
+Restart=always
+RestartSec=2
+ 
+[Install]
+WantedBy=multi-user.target
+SVCEOF
+ 
+# Both disabled at boot — server_bridge controls which one runs
+systemctl disable snapcast-source    2>/dev/null || true
+systemctl disable snapcast-sourcemic 2>/dev/null || true
 
 # ── 7. Create Server bridge service ──
 echo ""
@@ -240,8 +285,13 @@ SVCEOF
 echo ""
 echo "[8/9] Configuring sudoers..."
 
-echo "$REAL_USER ALL=(ALL) NOPASSWD: /usr/bin/systemctl restart snapserver" \
-    > /etc/sudoers.d/snapserver-restart
+cat > /etc/sudoers.d/snapserver-restart << SUDOEOF
+$REAL_USER ALL=(ALL) NOPASSWD: /usr/bin/systemctl restart snapserver
+$REAL_USER ALL=(ALL) NOPASSWD: /usr/bin/systemctl start snapcast-source
+$REAL_USER ALL=(ALL) NOPASSWD: /usr/bin/systemctl stop snapcast-source
+$REAL_USER ALL=(ALL) NOPASSWD: /usr/bin/systemctl start snapcast-sourcemic
+$REAL_USER ALL=(ALL) NOPASSWD: /usr/bin/systemctl stop snapcast-sourcemic
+SUDOEOF
 chmod 440 /etc/sudoers.d/snapserver-restart
 
 # Add user to dialout group for UART access
@@ -256,7 +306,6 @@ echo "[9/9] Enabling services..."
 
 systemctl daemon-reload
 systemctl enable snapserver
-systemctl enable snapcast-source
 systemctl enable server_bridge
 
 cat > /etc/sysctl.d/99-tcp-retries.conf << 'EOF'
