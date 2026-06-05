@@ -17,6 +17,12 @@ import time
 from typing import Optional
 
 import serial
+import dbus
+import dbus.mainloop.glib
+try:
+    from gi.repository import GObject as gobject
+except ImportError:
+    import gobject
 
 import shutil
 GPIO_AVAILABLE = bool(shutil.which("gpioset") and shutil.which("gpioget"))
@@ -86,6 +92,15 @@ def gpio_set(pin: int, state: bool):
         log.info("GPIO%d -> %s", pin, "HIGH" if state else "LOW")
     except Exception as e:
         log.error("gpio_set GPIO%d failed: %s", pin, e)
+    
+    # Write power state for fan controller                                                                        # Write power state for fan controller
+    try:
+        dsp = _gpio_state.get(GPIO_DSP, False)
+        amp = _gpio_state.get(GPIO_AMP, False)
+        with open("/tmp/power_state", "w") as f:
+            f.write(f"{int(dsp)} {int(amp)}\n")
+    except Exception:
+        pass
 
 
 def gpio_get(pin: int) -> bool:
@@ -401,7 +416,9 @@ def bt_stop_discoverable():
     except Exception:
         pass
 
+
 def bt_get_connected_device() -> tuple[bool, str]:
+    """Returns (connected, name)."""
     try:
         result = subprocess.run(["bluetoothctl", "info"],
                                 capture_output=True, text=True, timeout=5)
@@ -413,6 +430,7 @@ def bt_get_connected_device() -> tuple[bool, str]:
         return False, ""
     except Exception:
         return False, ""
+
 
 def _find_bt_source_name() -> Optional[str]:
     try:
@@ -445,7 +463,7 @@ def bt_get_source_volume() -> Optional[int]:
 def bt_set_source_volume(percent: int) -> bool:
     source = _find_bt_source_name()
     if not source:
-        log.warning("bt_set_source_volume: no A2DP source found")
+        log.warning("bt_set_source_volume: no A2DP source found (paused?)")
         return False
     try:
         subprocess.run(["pactl", "set-source-volume", source, f"{percent}%"],
@@ -454,6 +472,65 @@ def bt_set_source_volume(percent: int) -> bool:
         return True
     except Exception as e:
         log.warning("bt_set_source_volume error: %s", e)
+        return False
+
+
+def _find_bt_transport_path() -> Optional[str]:
+    """Find the current A2DP MediaTransport1 object path in BlueZ DBus tree."""
+    try:
+        bus = dbus.SystemBus()
+        mgr = dbus.Interface(
+            bus.get_object("org.bluez", "/"),
+            "org.freedesktop.DBus.ObjectManager")
+        objects = mgr.GetManagedObjects()
+        for path, ifaces in objects.items():
+            if "org.bluez.MediaTransport1" in ifaces:
+                return str(path)
+    except Exception as e:
+        log.warning("_find_bt_transport_path error: %s", e)
+    return None
+
+
+def bt_dbus_get_volume() -> Optional[int]:
+    """
+    Read AVRCP volume directly from BlueZ MediaTransport1.
+    Works even when transport is idle (paused).
+    Returns 0-100 percent or None if no transport found.
+    """
+    path = _find_bt_transport_path()
+    if not path:
+        return None
+    try:
+        bus = dbus.SystemBus()
+        obj   = bus.get_object("org.bluez", path)
+        props = dbus.Interface(obj, "org.freedesktop.DBus.Properties")
+        bluez_vol = int(props.Get("org.bluez.MediaTransport1", "Volume"))
+        return round(bluez_vol / BlueZWatcher.BLUEZ_VOL_MAX * 100)
+    except Exception as e:
+        log.warning("bt_dbus_get_volume error: %s", e)
+    return None
+
+
+def bt_dbus_set_volume(percent: int) -> bool:
+    """
+    Set AVRCP volume via BlueZ MediaTransport1 DBus.
+    Only works when transport is active (not paused).
+    Returns True on success.
+    """
+    path = _find_bt_transport_path()
+    if not path:
+        log.warning("bt_dbus_set_volume: no transport found")
+        return False
+    try:
+        bus   = dbus.SystemBus()
+        obj   = bus.get_object("org.bluez", path)
+        props = dbus.Interface(obj, "org.freedesktop.DBus.Properties")
+        bluez_vol = dbus.UInt16(round(max(0, min(100, percent)) / 100 * BlueZWatcher.BLUEZ_VOL_MAX))
+        props.Set("org.bluez.MediaTransport1", "Volume", bluez_vol)
+        log.info("BlueZ AVRCP volume set: %d%% -> BlueZ %d", percent, int(bluez_vol))
+        return True
+    except Exception as e:
+        log.warning("bt_dbus_set_volume error (transport may be idle): %s", e)
         return False
 
 
@@ -550,7 +627,23 @@ class PasswordListener(threading.Thread):
                 log.error("Password listener error: %s", e)
 
 
-class PactlSourceWatcher(threading.Thread):
+class BlueZWatcher(threading.Thread):
+    """
+    Watches org.bluez.MediaTransport1 PropertiesChanged signals via DBus.
+
+    Fires:
+      on_volume_change(percent 0-100) — phone changed AVRCP volume.
+                                        Fires even when transport is idle/paused.
+      on_source_appeared(percent)     — transport went active (resume from pause
+                                        or fresh connect). Also watches pactl
+                                        for 'new source' so fresh pair is caught.
+      on_source_removed()             — transport went idle / source removed.
+
+    Volume conversion: BlueZ uses 0-127, we use 0-100.
+    """
+
+    BLUEZ_VOL_MAX = 127
+
     def __init__(self, on_volume_change, on_source_appeared, on_source_removed):
         super().__init__(daemon=True)
         self._on_vol      = on_volume_change
@@ -558,25 +651,80 @@ class PactlSourceWatcher(threading.Thread):
         self._on_removed  = on_source_removed
         self._active      = False
         self._lock        = threading.Lock()
+        self._mainloop    = None
+        self._bus         = None
 
     def activate(self):
         with self._lock:
             self._active = True
-        log.info("PactlSourceWatcher activated")
+        log.info("BlueZWatcher activated")
 
     def deactivate(self):
         with self._lock:
             self._active = False
-        log.info("PactlSourceWatcher deactivated")
+        # Quit the GLib mainloop so the thread can restart cleanly next time
+        if self._mainloop and self._mainloop.is_running():
+            self._mainloop.quit()
+        log.info("BlueZWatcher deactivated")
 
-    def run(self):
+    @staticmethod
+    def bluez_to_percent(vol: int) -> int:
+        """Convert BlueZ 0-127 volume to 0-100 percent."""
+        return round(vol / BlueZWatcher.BLUEZ_VOL_MAX * 100)
+
+    @staticmethod
+    def percent_to_bluez(percent: int) -> int:
+        """Convert 0-100 percent to BlueZ 0-127."""
+        return round(max(0, min(100, percent)) / 100 * BlueZWatcher.BLUEZ_VOL_MAX)
+
+    def _on_properties_changed(self, interface, changed, invalidated, path):
+        """DBus signal handler — runs in GLib mainloop thread."""
+        with self._lock:
+            active = self._active
+        if not active:
+            return
+
+        if interface != "org.bluez.MediaTransport1":
+            return
+
+        if "Volume" in changed:
+            bluez_vol = int(changed["Volume"])
+            percent   = self.bluez_to_percent(bluez_vol)
+            log.info("BlueZ AVRCP Volume changed: %d (%.0f%%)", bluez_vol, percent)
+            self._on_vol(percent)
+
+        if "State" in changed:
+            state = str(changed["State"])
+            log.info("BlueZ transport state: %s (%s)", state, path)
+            if state == "active":
+                # Transport just opened — read current volume from BlueZ
+                try:
+                    bus = dbus.SystemBus()
+                    obj = bus.get_object("org.bluez", path)
+                    props = dbus.Interface(obj, "org.freedesktop.DBus.Properties")
+                    bluez_vol = int(props.Get("org.bluez.MediaTransport1", "Volume"))
+                    percent   = self.bluez_to_percent(bluez_vol)
+                    log.info("Transport active — current BlueZ vol: %d (%.0f%%)",
+                             bluez_vol, percent)
+                    self._on_appeared(percent)
+                except Exception as e:
+                    log.warning("BlueZWatcher: failed to read vol on active: %s", e)
+                    self._on_appeared(0)
+            elif state == "idle":
+                self._on_removed()
+
+    def _pactl_source_thread(self):
+        """
+        Runs alongside the DBus watcher to catch fresh pair events.
+        pactl subscribe fires 'new source' when the A2DP source first appears
+        (fresh pair), which doesn't always produce a DBus 'active' state event.
+        """
         while True:
             with self._lock:
                 active = self._active
             if not active:
                 time.sleep(0.5)
                 continue
-            log.info("Starting pactl subscribe watcher")
             try:
                 proc = subprocess.Popen(["pactl", "subscribe"],
                                         stdout=subprocess.PIPE,
@@ -587,26 +735,76 @@ class PactlSourceWatcher(threading.Thread):
                         active = self._active
                     if not active:
                         break
-                    if "new" in line and "source" in line:
+                    if "new" in line and "source" in line and "bluez" in line.lower():
                         time.sleep(0.5)
-                        self._on_appeared()
-                    elif "remove" in line and "source" in line:
-                        self._on_removed()
-                    elif "change" in line and "source" in line:
-                        time.sleep(0.15)
-                        vol = bt_get_source_volume()
-                        if vol is not None:
-                            self._on_vol(vol)
+                        # Fresh pair — read BlueZ vol directly
+                        try:
+                            bus = dbus.SystemBus()
+                            mgr = dbus.Interface(
+                                bus.get_object("org.bluez", "/"),
+                                "org.freedesktop.DBus.ObjectManager")
+                            objects = mgr.GetManagedObjects()
+                            for path, ifaces in objects.items():
+                                if "org.bluez.MediaTransport1" in ifaces:
+                                    props = ifaces["org.bluez.MediaTransport1"]
+                                    if "Volume" in props:
+                                        bluez_vol = int(props["Volume"])
+                                        percent   = self.bluez_to_percent(bluez_vol)
+                                        log.info("pactl: new BT source, BlueZ vol %d (%.0f%%)",
+                                                 bluez_vol, percent)
+                                        self._on_appeared(percent)
+                                        break
+                            else:
+                                self._on_appeared(0)
+                        except Exception as e:
+                            log.warning("pactl source thread vol read failed: %s", e)
+                            self._on_appeared(0)
                 proc.terminate()
                 proc.wait()
             except Exception as e:
-                log.warning("PactlSourceWatcher error: %s", e)
+                log.warning("pactl source thread error: %s", e)
                 time.sleep(2)
+
+    def run(self):
+        # Start pactl source watcher in a sibling thread
+        threading.Thread(target=self._pactl_source_thread, daemon=True).start()
+
+        while True:
+            with self._lock:
+                active = self._active
+            if not active:
+                time.sleep(0.5)
+                continue
+
+            log.info("Starting BlueZ DBus watcher")
+            try:
+                dbus.mainloop.glib.DBusGMainLoop(set_as_default=True)
+                bus = dbus.SystemBus()
+                self._bus = bus
+
+                bus.add_signal_receiver(
+                    self._on_properties_changed,
+                    bus_name="org.bluez",
+                    signal_name="PropertiesChanged",
+                    dbus_interface="org.freedesktop.DBus.Properties",
+                    path_keyword="path",
+                )
+
+                self._mainloop = gobject.MainLoop()
+                self._mainloop.run()
+
+            except Exception as e:
+                log.warning("BlueZWatcher error: %s", e)
+                time.sleep(2)
+            finally:
+                self._bus = None
+                self._mainloop = None
 
 
 class ClientBridge:
-    ESP_TIMEOUT_S = 20
-    RPC_RETRY_S   = 5.0
+    ESP_TIMEOUT_S   = 20
+    RPC_RETRY_S     = 5.0
+    POLL_INTERVAL_S = 5.0   # BT periodic fallback poll
 
     def __init__(self, serial_port: str, baud: int, server_ip: str):
         self.ser       = serial.Serial(serial_port, baud, timeout=0.05)
@@ -618,11 +816,10 @@ class ClientBridge:
         self.hostname = get_hostname()
         self.volume   = 0
 
-        # Always start as powered off — sequence will turn on and report
         self.dsp_on = False
         self.amp_on = False
 
-        self._power_lock = threading.Lock()
+        self._power_lock    = threading.Lock()
         self._power_on_done = threading.Event()
 
         self.rpc              = SnapcastRPC()
@@ -631,9 +828,18 @@ class ClientBridge:
         self._esp_vol_set_time = 0.0
         self._last_rpc_attempt = 0.0
 
-        self.bt_connected = False
-        self.bt_dev_name  = ""
+        self.bt_connected  = False
+        self.bt_dev_name   = ""
+
+        # Echo guard: suppress pactl vol events for 1 s after we set volume.
         self._bt_vol_set_time = 0.0
+        self._bt_ignore_next_vol = False  # suppress phone vol after fresh pair
+
+        # Desired BT volume — always updated even when source is absent (paused).
+        # Applied to the source the moment it re-appears.
+        self._bt_desired_vol: int = 0
+
+        self._last_poll_time = 0.0
 
         self._esp_connected     = False
         self._last_esp_msg_time = time.time()
@@ -643,17 +849,16 @@ class ClientBridge:
         self._pw_listener = PasswordListener(self._on_pw_broadcast)
         self._pw_listener.start()
 
-        self._vol_lock = threading.Lock()
+        self._vol_lock          = threading.Lock()
         self._pending_rpc_vol: Optional[int] = None
-
-        self._rpc_lock = threading.Lock()
+        self._rpc_lock          = threading.Lock()
         self._vol_flush_running = threading.Event()
 
         self._srv_sock: Optional[socket.socket] = None
-        self._srv_lock = threading.Lock()
+        self._srv_lock       = threading.Lock()
         self._last_ping_time = time.time()
 
-        self._source_watcher = PactlSourceWatcher(
+        self._source_watcher = BlueZWatcher(
             self._on_bt_source_volume_changed,
             self._on_bt_source_appeared,
             self._on_bt_source_removed,
@@ -664,12 +869,9 @@ class ClientBridge:
     def powered(self) -> bool:
         return self.dsp_on and self.amp_on
 
-    # ── Server connection ──
+    # ── Server connection ──────────────────────────────────────────────────
     def _server_connect_loop(self):
-        # Wait for power on sequence to complete before registering
-        # so server gets powered=True on first register
         self._power_on_done.wait()
-
         while self._running:
             try:
                 sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -681,23 +883,17 @@ class ClientBridge:
                 sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE,  10)
                 sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 5)
                 sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT,   3)
-
                 with self._srv_lock:
-                    self._srv_sock = sock
+                    self._srv_sock       = sock
                     self._last_ping_time = time.time()
-
                 self._send_register(sock)
-
                 h = fetch_hash_from_server(self.server_ip)
                 if h:
                     save_password_hash(h)
                     self._pw_hash = h
-
                 self._server_recv_loop(sock)
-
             except Exception as e:
-                log.warning("Server connect failed: %s — retry in %ds",
-                            e, REGISTER_RETRY_S)
+                log.warning("Server connect failed: %s — retry in %ds", e, REGISTER_RETRY_S)
                 with self._srv_lock:
                     self._srv_sock = None
             time.sleep(REGISTER_RETRY_S)
@@ -751,12 +947,10 @@ class ClientBridge:
 
     def _on_server_message(self, msg: dict):
         mtype = msg.get("type", "")
-
         if mtype == "ping":
             with self._srv_lock:
                 self._last_ping_time = time.time()
             self._srv_send({"type": "pong"})
-
         elif mtype == "set_volume":
             vol = msg.get("volume", self.volume)
             self._esp_vol_set_time = time.time()
@@ -769,13 +963,11 @@ class ClientBridge:
                     self._vol_flush_running.set()
                     threading.Thread(target=self._flush_vol, daemon=True).start()
             self.send_vol_update(vol)
-
         elif mtype == "set_mode":
             new_mode = msg.get("mode", self.mode)
             if new_mode != self.mode:
                 threading.Thread(target=self._do_mode_switch,
                                  args=(new_mode,), daemon=True).start()
-
         elif mtype == "set_powered":
             powered = msg.get("powered", self.powered)
             threading.Thread(target=self._do_power_sequence,
@@ -814,7 +1006,7 @@ class ClientBridge:
     def _broadcast_switching(self):
         self._srv_send({"type": "switching"})
 
-    # ── UART ──
+    # ── UART ──────────────────────────────────────────────────────────────
     def send_frame(self, msg_type: int, payload: bytes = b""):
         frame = build_frame(msg_type, payload)
         self.ser.write(frame)
@@ -850,20 +1042,22 @@ class ClientBridge:
         self._last_state_sent = payload
         self.send_frame(MSG_STATE_UPDATE, payload)
 
-    # ── Relay helpers ──
+    # ── Relay helpers ──────────────────────────────────────────────────────
     def _power_on_sequence(self):
-        """Turn on DSP then AMP with delay. Sets event when done."""
         with self._power_lock:
             log.info("Power ON: turning DSP on")
             gpio_set(GPIO_DSP, True)
             self.dsp_on = True
-            time.sleep(GPIO_DELAY)
+        # Broadcast DSP=on immediately so ESP/server see it light up
+        self.broadcast_ctrl_state()
+        self._broadcast_power()
+        self.send_state(force=True)
+        time.sleep(GPIO_DELAY)
+        with self._power_lock:
             log.info("Power ON: turning AMP on")
             gpio_set(GPIO_AMP, True)
             self.amp_on = True
-            log.info("Power ON: sequence complete — powered=%s", self.powered)
-
-        # Sequence done — tell everyone
+            log.info("Power ON: complete — powered=%s", self.powered)
         self._power_on_done.set()
         self.broadcast_ctrl_state()
         self._broadcast_power()
@@ -885,24 +1079,31 @@ class ClientBridge:
             self.send_state(force=True)
 
     def _power_on_missing(self):
-        """Turn on any relay that's currently off."""
         with self._power_lock:
             if not self.dsp_on:
                 log.info("Power ON: turning DSP on")
                 gpio_set(GPIO_DSP, True)
                 self.dsp_on = True
-                time.sleep(GPIO_DELAY)
-            if not self.amp_on:
+            else:
+                log.info("Power ON: DSP already on")
+        # Broadcast DSP state immediately before the delay
+        self.broadcast_ctrl_state()
+        self._broadcast_power()
+        self.send_state(force=True)
+        if not self.amp_on:
+            time.sleep(GPIO_DELAY)
+            with self._power_lock:
                 log.info("Power ON: turning AMP on")
                 gpio_set(GPIO_AMP, True)
                 self.amp_on = True
             log.info("Power ON: complete — powered=%s", self.powered)
+            self.broadcast_ctrl_state()
+            self._broadcast_power()
+            self.send_state(force=True)
+        else:
+            log.info("Power ON: AMP already on — complete")
 
-        self.broadcast_ctrl_state()
-        self._broadcast_power()
-        self.send_state(force=True)
-
-    # ── Audio start/stop ──
+    # ── Audio start/stop ───────────────────────────────────────────────────
     def _stop_audio(self):
         log.info("Powered off — stopping audio services")
         if self.mode == MODE_BT:
@@ -942,7 +1143,7 @@ class ClientBridge:
             self.client_id = None
             self._last_rpc_attempt = 0.0
 
-    # ── Power sequences ──
+    # ── Power sequences ────────────────────────────────────────────────────
     def _do_power_sequence(self, powered: bool):
         if not self._power_lock.acquire(blocking=False):
             log.warning("Power sequence already in progress")
@@ -971,17 +1172,13 @@ class ClientBridge:
         try:
             gpio_set(GPIO_DSP, on)
             self.dsp_on = gpio_get(GPIO_DSP)
-            if not self.powered:
-                self._power_lock.release()
-                self._stop_audio()
-                return
-            else:
-                self._power_lock.release()
-                self._start_audio()
-                return
         finally:
-            if self._power_lock.locked():
-                self._power_lock.release()
+            self._power_lock.release()
+        log.info("DSP -> %s, powered=%s", on, self.powered)
+        if not self.powered:
+            self._stop_audio()
+        else:
+            self._start_audio()
         self.broadcast_ctrl_state()
         self._broadcast_power()
         self.send_state(force=True)
@@ -993,56 +1190,59 @@ class ClientBridge:
         try:
             gpio_set(GPIO_AMP, on)
             self.amp_on = gpio_get(GPIO_AMP)
-            if not self.powered:
-                self._power_lock.release()
-                self._stop_audio()
-                return
-            else:
-                self._power_lock.release()
-                self._start_audio()
-                return
         finally:
-            if self._power_lock.locked():
-                self._power_lock.release()
+            self._power_lock.release()
+        log.info("AMP -> %s, powered=%s", on, self.powered)
+        if not self.powered:
+            self._stop_audio()
+        else:
+            self._start_audio()
         self.broadcast_ctrl_state()
         self._broadcast_power()
         self.send_state(force=True)
 
-    # ── AVRCP / BT volume ──
-    def _on_bt_source_appeared(self):
+    # ── AVRCP / BT volume ─────────────────────────────────────────────────
+    def _on_bt_source_appeared(self, percent: int):
         if self.mode != MODE_BT:
             return
-
-        time.sleep(0.5)
         pa_set_volume(100)
-
         if not self.bt_connected:
-            log.info("BT source appeared — new device, forcing volume to 0")
-            self.bt_connected = True
-            self.volume = 0
+            # Fresh pair — set to 0
+            log.info("BT source appeared (fresh pair) — setting volume to 0")
+            self.bt_connected    = True
+            conn, name = bt_get_connected_device()
+            self.bt_dev_name     = name
+            self.volume          = 0
+            self._bt_desired_vol = 0
             self._bt_vol_set_time = time.time()
-            bt_set_source_volume(0)
+            # Phone sends its own vol notification right after pairing —
+            # ignore just that one event so our 0 push sticks.
+            self._bt_ignore_next_vol = True
+            bt_dbus_set_volume(0)
             self.send_vol_update(0)
         else:
-            log.info("BT source re-appeared (pause/track change) — syncing volume")
-            vol = bt_get_source_volume()
-            if vol is not None:
-                self.volume = vol
-                self._bt_vol_set_time = time.time()
-                self.send_vol_update(vol)
-
+            # Same device re-appeared after pause — apply desired vol
+            desired = self._bt_desired_vol
+            log.info("BT source re-appeared (pause resume) — applying vol %d%%", desired)
+            self._bt_vol_set_time = time.time()
+            bt_dbus_set_volume(desired)
+            self.volume = desired
+            self.send_vol_update(desired)
         self.send_state(force=True)
         self.broadcast_ctrl_state()
-        
+
+
     def _on_bt_source_removed(self):
         if self.mode != MODE_BT:
             return
-        log.info("BT source removed — checking if device still paired/connected")
-        time.sleep(0.5)  # let bluetoothctl state settle
-        conn, name = bt_get_connected_device()
-        if conn:
-            log.info("Device still connected ('%s') — source removal was pause/track change, ignoring", name)
-            return
+        log.info("BT source removed — waiting for BT stack to settle")
+        # Poll multiple times — some stacks are slow to update bluetoothctl
+        for wait in (1.0, 1.0, 1.0):
+            time.sleep(wait)
+            conn, name = bt_get_connected_device()
+            if conn:
+                log.info("Device still connected ('%s') — source removal was pause, ignoring", name)
+                return
         log.info("Device genuinely disconnected — clearing BT state")
         self.bt_connected = False
         self.bt_dev_name  = ""
@@ -1050,37 +1250,92 @@ class ClientBridge:
         self.broadcast_ctrl_state()
 
     def _on_bt_source_volume_changed(self, percent: int):
+        """Phone changed volume while source is live."""
         if self.mode != MODE_BT:
             return
-        if time.time() - self._bt_vol_set_time < 1.0:
+        if self._bt_ignore_next_vol:
+            log.info("BT vol event ignored (post-pair suppress): %d%%", percent)
+            self._bt_ignore_next_vol = False
+            return
+        if time.time() - self._bt_vol_set_time < 0.3:
+            log.debug("BT source vol suppressed (echo guard): %d%%", percent)
             return
         if percent == self.volume:
             return
         log.info("Phone changed BT volume: %d%% -> %d%%", self.volume, percent)
-        self.volume = percent
+        self.volume          = percent
+        self._bt_desired_vol = percent
         self.send_vol_update(percent)
         self.send_state()
         self.broadcast_ctrl_state()
 
     def _set_bt_volume(self, percent: int):
+        """
+        Set BT volume from ESP or server UI.
+        Tries DBus first (works when transport active), falls back to pactl.
+        Always updates _bt_desired_vol so on resume the correct vol is applied.
+        """
         percent = max(0, min(100, percent))
         self._bt_vol_set_time = time.time()
-        bt_set_source_volume(percent)
-        self.volume = percent
+        self._bt_desired_vol  = percent
+        self.volume           = percent
+        # Set via DBus — works when transport active, queued for resume when idle
+        if not bt_dbus_set_volume(percent):
+            log.info("Transport idle (paused) — vol %d%% queued for resume", percent)
 
-    # ── Password ──
+    def poll_bt(self):
+        """
+        Periodic fallback — catches state/volume drift the watcher may miss,
+        especially while the A2DP source is absent during pause.
+        """
+        conn, name = bt_get_connected_device()
+        changed = False
+
+        if conn != self.bt_connected:
+            self.bt_connected = conn
+            changed = True
+            if conn:
+                # Device just connected during a poll cycle (watcher missed it)
+                # Reset desired vol to 0 and push it — same as fresh pair
+                log.info("BT poll: new device connected — pushing volume 0")
+                self._bt_desired_vol = 0
+                self.volume          = 0
+                self._bt_vol_set_time = time.time()
+                bt_dbus_set_volume(0)
+                self.send_vol_update(0)
+
+        if name != self.bt_dev_name:
+            self.bt_dev_name = name
+            changed = True
+
+        # Sync volume from BlueZ DBus (works even when paused).
+        # If DBus returns None fall back to pactl.
+        if conn and time.time() - self._bt_vol_set_time >= 1.0:
+            src_vol = bt_dbus_get_volume()
+            if src_vol is not None and src_vol != self.volume:
+                log.info("BT poll: volume drift %d%% -> %d%%", self.volume, src_vol)
+                self.volume          = src_vol
+                self._bt_desired_vol = src_vol
+                self.send_vol_update(src_vol)
+                changed = True
+
+        if changed:
+            self.send_state()
+            self.broadcast_ctrl_state()
+
+    # ── Password ──────────────────────────────────────────────────────────
     def _on_pw_broadcast(self, h: str):
         save_password_hash(h)
         self._pw_hash = h
         log.info("Password updated from broadcast")
 
     def _handle_pw_check(self, payload: bytes):
-        raw = payload.rstrip(b"\x00").decode("utf-8", errors="replace")
+        raw   = payload.rstrip(b"\x00").decode("utf-8", errors="replace")
         match = (sha256_hex(raw) == self._pw_hash)
         self.send_frame(MSG_PW_RESULT, bytes([1 if match else 0]))
         log.info("PW_CHECK: %s", "correct" if match else "wrong")
 
-    # ── Rename ──
+    # ── Rename ────────────────────────────────────────────────────────────
     def _handle_rename(self, payload: bytes):
         new_name = payload.rstrip(b"\x00").decode("utf-8", errors="replace")
         new_name = re.sub(r"[^a-zA-Z0-9\-]", "", new_name)[:32]
@@ -1115,7 +1370,7 @@ class ClientBridge:
         except subprocess.CalledProcessError as e:
             log.error("hostnamectl failed: %s", e)
 
-    # ── RPC ──
+    # ── RPC ───────────────────────────────────────────────────────────────
     def ensure_rpc(self):
         now = time.time()
         if now - self._last_rpc_attempt < self.RPC_RETRY_S:
@@ -1140,7 +1395,7 @@ class ClientBridge:
                 self.send_vol_update(0)
                 self.broadcast_ctrl_state()
 
-    # ── Mode transitions ──
+    # ── Mode transitions ──────────────────────────────────────────────────
     def enter_sync_mode(self):
         log.info("=== ENTERING SYNC MODE ===")
         self.mode = MODE_SYNC
@@ -1155,12 +1410,12 @@ class ClientBridge:
             snapclient_start()
             time.sleep(2)
         self.rpc.disconnect()
-        self._snap_server_ip = None
-        self.client_id       = None
+        self._snap_server_ip   = None
+        self.client_id         = None
         self._last_rpc_attempt = 0.0
-        self.bt_connected    = False
-        self.bt_dev_name     = ""
-        self.volume          = 0
+        self.bt_connected      = False
+        self.bt_dev_name       = ""
+        self.volume            = 0
         for _ in range(5):
             self._snap_server_ip = get_snapserver_ip()
             if self._snap_server_ip and self.rpc.connect(self._snap_server_ip):
@@ -1177,8 +1432,8 @@ class ClientBridge:
         self.mode = MODE_BT
         self.send_frame(MSG_MODE_SWITCHING, bytes([MODE_BT]))
         self.rpc.disconnect()
-        self.client_id       = None
-        self._snap_server_ip = None
+        self.client_id         = None
+        self._snap_server_ip   = None
         snapclient_stop()
         time.sleep(1)
         pulseaudio_start()
@@ -1186,14 +1441,15 @@ class ClientBridge:
         try:
             subprocess.run(["pactl", "load-module", "module-loopback",
                             "latency_msec=500"],
-                        timeout=5, capture_output=True)
+                           timeout=5, capture_output=True)
             log.info("Loopback module loaded")
         except Exception as e:
             log.error("loopback load failed: %s", e)
         bt_agent_start()
-        self.volume = 0
+        self.volume            = 0
+        self._bt_desired_vol   = 0
         pa_set_volume(100)
-        self._bt_vol_set_time = time.time()  # guard open — suppress all incoming vol events
+        self._bt_vol_set_time  = time.time()
         self._source_watcher.activate()
         self.send_state(force=True)
         self.broadcast_ctrl_state()
@@ -1220,8 +1476,8 @@ class ClientBridge:
                             self.rpc.set_volume(self.client_id, vol)
         finally:
             self._vol_flush_running.clear()
-                        
-    # ── ESP message handling ──
+
+    # ── ESP message handling ───────────────────────────────────────────────
     def handle_esp_message(self, msg_type: int, payload: bytes):
         self._last_esp_msg_time = time.time()
         if not self._esp_connected:
@@ -1290,7 +1546,7 @@ class ClientBridge:
         else:
             log.warning("Unknown ESP msg: 0x%02X", msg_type)
 
-    # ── Snap notifications ──
+    # ── Snap notifications ─────────────────────────────────────────────────
     def handle_snap_notifications(self):
         if not self.rpc.connected:
             return
@@ -1320,13 +1576,11 @@ class ClientBridge:
                 self.send_state(force=True)
                 self.broadcast_ctrl_state()
 
-    # ── Main loop ──
+    # ── Main loop ──────────────────────────────────────────────────────────
     def run(self):
         log.info("Client bridge — %s @ %d — hostname: %s",
                  self.ser.port, self.ser.baudrate, self.hostname)
 
-        # Always start off, always power on, signal when done
-        # Server connection waits for this before registering
         threading.Thread(target=self._power_on_sequence, daemon=True).start()
         threading.Thread(target=self._server_connect_loop, daemon=True).start()
 
@@ -1345,26 +1599,33 @@ class ClientBridge:
                     log.warning("ESP silent — marking disconnected")
                     self._esp_connected = False
 
-            if self._esp_connected:
-                now = time.time()
-                if self.mode == MODE_SYNC:
-                    self.ensure_rpc()
-                    self.handle_snap_notifications()
-                    if now - last_heavy_poll >= 10.0:
-                        last_heavy_poll = now
-                        if self.rpc.connected and self.client_id:
-                            try:
-                                vol = self.rpc.get_volume_for_client(self.client_id)
-                                if vol is not None and vol != self.volume:
-                                    if time.time() - self._esp_vol_set_time >= 1.0:
-                                        self.volume = vol
-                                        self.send_vol_update(vol)
-                            except Exception:
-                                self.rpc.disconnect()
-                                self.client_id = None
-                                self._last_rpc_attempt = 0.0
-                                self.send_state(force=True)
-                                self.broadcast_ctrl_state()
+            # SYNC mode RPC runs regardless of ESP state so the zone works
+            # even when the ESP UART is disconnected/silent.
+            now = time.time()
+            if self.mode == MODE_SYNC:
+                self.ensure_rpc()
+                self.handle_snap_notifications()
+                if now - last_heavy_poll >= 10.0:
+                    last_heavy_poll = now
+                    if self.rpc.connected and self.client_id:
+                        try:
+                            vol = self.rpc.get_volume_for_client(self.client_id)
+                            if vol is not None and vol != self.volume:
+                                if time.time() - self._esp_vol_set_time >= 1.0:
+                                    self.volume = vol
+                                    self.send_vol_update(vol)
+                        except Exception:
+                            self.rpc.disconnect()
+                            self.client_id = None
+                            self._last_rpc_attempt = 0.0
+                            self.send_state(force=True)
+                            self.broadcast_ctrl_state()
+
+            # BT periodic fallback — runs regardless of ESP state
+            if self.mode == MODE_BT:
+                if now - self._last_poll_time >= self.POLL_INTERVAL_S:
+                    self._last_poll_time = now
+                    self.poll_bt()
 
 
 def main():
