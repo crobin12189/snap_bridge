@@ -61,7 +61,6 @@ apt install -y \
 # Prevent snapserver and pipewire from being auto-upgraded
 apt-mark hold snapserver pipewire pipewire-pulse
 
-usermod -aG gpio "$REAL_USER"
 # ── 3. Configure boot config and kernel modules ──
 echo ""
 echo "[3/9] Configuring boot config and USB gadget audio..."
@@ -298,6 +297,8 @@ chmod 440 /etc/sudoers.d/snapserver-restart
 
 # Add user to dialout group for UART access
 usermod -aG dialout "$REAL_USER"
+
+usermod -aG gpio "$REAL_USER"
 
 # Enable linger so PipeWire (user service) starts at boot without login
 loginctl enable-linger "$REAL_USER"
