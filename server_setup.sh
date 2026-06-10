@@ -55,11 +55,13 @@ apt install -y \
     pipewire=1.2.7* pipewire-pulse=1.2.7* wireplumber \
     pulseaudio-utils=16.1+dfsg1-2+rpt1.1 \
     alsa-utils \
+    gpiod \
     python3 python3-pip python3-venv python3-serial
 
 # Prevent snapserver and pipewire from being auto-upgraded
 apt-mark hold snapserver pipewire pipewire-pulse
 
+usermod -aG gpio "$REAL_USER"
 # ── 3. Configure boot config and kernel modules ──
 echo ""
 echo "[3/9] Configuring boot config and USB gadget audio..."
