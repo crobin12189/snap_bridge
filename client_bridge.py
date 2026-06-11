@@ -70,6 +70,7 @@ PW_DEFAULT         = "anjay1234"
 
 GPIO_DSP   = 17
 GPIO_AMP   = 27
+GPIO_LED   = 26
 GPIO_DELAY = 10.0
 GPIO_CHIP  = "gpiochip0"
 
@@ -102,6 +103,15 @@ def gpio_set(pin: int, state: bool):
     except Exception:
         pass
 
+    try:
+        dsp = _gpio_state.get(GPIO_DSP, False)
+        amp = _gpio_state.get(GPIO_AMP, False)
+        led_val = 1 if (dsp and amp) else 0
+        subprocess.run(["gpioset", GPIO_CHIP, f"{GPIO_LED}={led_val}"],
+                       timeout=3, capture_output=True)
+    except Exception:
+        pass
+
 
 def gpio_get(pin: int) -> bool:
     return _gpio_state.get(pin, False)
@@ -110,7 +120,7 @@ def gpio_get(pin: int) -> bool:
 def gpio_cleanup():
     if not GPIO_AVAILABLE:
         return
-    for pin in (GPIO_DSP, GPIO_AMP):
+    for pin in (GPIO_DSP, GPIO_AMP, GPIO_LED):
         try:
             subprocess.run(["gpioset", GPIO_CHIP, f"{pin}=0"],
                            timeout=3, capture_output=True)
@@ -1282,6 +1292,7 @@ class ClientBridge:
         # Set via DBus — works when transport active, queued for resume when idle
         if not bt_dbus_set_volume(percent):
             log.info("Transport idle (paused) — vol %d%% queued for resume", percent)
+        self.broadcast_ctrl_state()
 
     def poll_bt(self):
         """
