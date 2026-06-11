@@ -965,7 +965,7 @@ class ClientBridge:
             vol = msg.get("volume", self.volume)
             self._esp_vol_set_time = time.time()
             if self.mode == MODE_BT:
-                self._set_bt_volume(vol)
+                self._set_bt_volume(vol, broadcast=False)
             else:
                 self.volume = vol
                 self._pending_rpc_vol = vol
@@ -1279,20 +1279,15 @@ class ClientBridge:
         self.send_state()
         self.broadcast_ctrl_state()
 
-    def _set_bt_volume(self, percent: int):
-        """
-        Set BT volume from ESP or server UI.
-        Tries DBus first (works when transport active), falls back to pactl.
-        Always updates _bt_desired_vol so on resume the correct vol is applied.
-        """
+    def _set_bt_volume(self, percent: int, broadcast: bool = True):
         percent = max(0, min(100, percent))
         self._bt_vol_set_time = time.time()
         self._bt_desired_vol  = percent
         self.volume           = percent
-        # Set via DBus — works when transport active, queued for resume when idle
         if not bt_dbus_set_volume(percent):
             log.info("Transport idle (paused) — vol %d%% queued for resume", percent)
-        self.broadcast_ctrl_state()
+        if broadcast:
+            self.broadcast_ctrl_state()
 
     def poll_bt(self):
         """
