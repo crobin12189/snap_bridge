@@ -1364,6 +1364,16 @@ class ClientBridge:
             except OSError as e:
                 log.warning("Could not update /etc/hosts: %s", e)
             self.hostname = new_name
+    
+            # Restart bluetooth so the adapter picks up the new name
+            subprocess.run(["sudo", "systemctl", "restart", "bluetooth"],
+                           timeout=10, capture_output=True)
+            time.sleep(1)
+            if self.mode == MODE_BT:
+                bt_agent_start()
+                if not self.bt_connected:
+                    bt_start_discoverable()
+    
             if self.mode == MODE_SYNC and snapclient_is_running():
                 snapclient_stop()
                 time.sleep(1)
