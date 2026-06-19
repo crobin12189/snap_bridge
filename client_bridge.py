@@ -1352,19 +1352,36 @@ class ClientBridge:
         try:
             subprocess.run(["sudo", "hostnamectl", "set-hostname", new_name],
                            timeout=5, check=True, capture_output=True)
+
+            # Rebuild /etc/hosts with exactly one correct 127.0.1.1 entry,
+            # writing to a temp file then sudo-mv'ing it in (works regardless
+            # of whether this process itself runs as root).
             try:
+                new_hosts_lines = []
+                found = False
                 with open("/etc/hosts", "r") as f:
-                    lines = f.readlines()
-                with open("/etc/hosts", "w") as f:
-                    for line in lines:
+                    for line in f:
                         if "127.0.1.1" in line:
-                            f.write(f"127.0.1.1\t{new_name}\n")
+                            if not found:
+                                new_hosts_lines.append(f"127.0.1.1\t{new_name}\n")
+                                found = True
+                            # drop any duplicate stale 127.0.1.1 lines
                         else:
-                            f.write(line)
-            except OSError as e:
+                            new_hosts_lines.append(line)
+                if not found:
+                    new_hosts_lines.append(f"127.0.1.1\t{new_name}\n")
+
+                tmp_path = "/tmp/hosts.new"
+                with open(tmp_path, "w") as f:
+                    f.writelines(new_hosts_lines)
+                subprocess.run(["sudo", "mv", tmp_path, "/etc/hosts"],
+                               timeout=5, check=True, capture_output=True)
+                log.info("Updated /etc/hosts -> 127.0.1.1 %s", new_name)
+            except (OSError, subprocess.CalledProcessError) as e:
                 log.warning("Could not update /etc/hosts: %s", e)
+
             self.hostname = new_name
-    
+
             # Restart bluetooth so the adapter picks up the new name
             subprocess.run(["sudo", "systemctl", "restart", "bluetooth"],
                            timeout=10, capture_output=True)
@@ -1373,7 +1390,7 @@ class ClientBridge:
                 bt_agent_start()
                 if not self.bt_connected:
                     bt_start_discoverable()
-    
+
             if self.mode == MODE_SYNC and snapclient_is_running():
                 snapclient_stop()
                 time.sleep(1)
@@ -1381,6 +1398,7 @@ class ClientBridge:
                 time.sleep(2)
                 self.client_id = None
                 self._last_rpc_attempt = 0.0
+
             self.send_state(force=True)
             self.broadcast_ctrl_state()
         except subprocess.CalledProcessError as e:
