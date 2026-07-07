@@ -12,6 +12,11 @@ from typing import Optional
 
 import serial
 
+import shutil
+GPIO_AVAILABLE = bool(shutil.which("gpioset"))
+GPIO_CHIP = "gpiochip0"
+GPIO_LED  = 26
+
 SYNC_0 = 0xAA
 SYNC_1 = 0x55
 MAX_PAYLOAD = 2048
@@ -34,6 +39,7 @@ MSG_STATE_UPDATE    = 0x20
 MSG_MODE_SWITCHING  = 0x21
 MSG_POWER_STATE     = 0x22
 MSG_PW_SET          = 0x30
+MSG_RENAME          = 0x33  # add at top with other constants
 MSG_PW_ACK          = 0x34
 
 MODE_SYNC = 0
@@ -49,7 +55,7 @@ PW_DEFAULT        = "anjay1234"
 PW_BROADCAST_PORT = 7700
 
 PING_INTERVAL_S  = 5
-PING_MISS_MAX    = 2
+PING_MISS_MAX    = 4
 
 logging.basicConfig(
     level=logging.INFO,
@@ -283,6 +289,9 @@ class ClientRecord:
             return
         try:
             sock.sendall((json.dumps(msg) + "\n").encode())
+        except BlockingIOError:
+            # send buffer momentarily full — transient, don't tear down a healthy socket
+            log.warning("ctrl_send to %s: send buffer busy, skipping this cycle", self.name)
         except Exception as e:
             log.warning("ctrl_send to %s failed: %s", self.name, e)
             with self._sock_lock:
@@ -675,9 +684,14 @@ class ServerBridge:
             rec.bt_connected   = msg.get("bt_connected",   rec.bt_connected)
             rec.bt_dev_name    = msg.get("bt_dev_name",    "")
             rec.powered        = msg.get("powered",        rec.powered)
+            
             new_name = msg.get("client_name", "")
             if new_name:
+                old_name = rec.name
                 rec.name = new_name
+                if old_name != new_name and self._esp_connected:
+                    self._send_client_list()   # ← name changed, push new list
+                    return                     # _send_client_list already calls _resend_all_states
 
             if self._esp_connected:
                 payload = self._id_bytes(rec.snap_id) + bytes([
@@ -689,7 +703,7 @@ class ServerBridge:
                 self.send_frame(MSG_STATE_UPDATE, payload)
                 self.send_frame(MSG_POWER_STATE,
                                 self._id_bytes(rec.snap_id) + bytes([1 if rec.powered else 0]))
-
+                
         elif mtype == "switching":
             if self._esp_connected:
                 self.send_frame(MSG_MODE_SWITCHING, self._id_bytes(rec.snap_id))
@@ -799,10 +813,17 @@ class ServerBridge:
             threading.Thread(target=self._restart_snapserver, daemon=True).start()
 
         elif msg_type == MSG_PW_SET:
-            raw = payload.rstrip(b"\x00").decode("utf-8", errors="replace")
-            if not raw:
+            if len(payload) < 64:
                 return
-            new_hash = sha256_hex(raw)
+            old_raw = payload[:64].rstrip(b"\x00").decode("utf-8", errors="replace")
+            new_raw = payload[64:].rstrip(b"\x00").decode("utf-8", errors="replace")
+            if not new_raw:
+                return
+            if self._pw_user_set and sha256_hex(old_raw) != self._pw_hash:
+                log.warning("Password change rejected: wrong current password")
+                self.send_frame(MSG_PW_ACK, bytes([0]))
+                return
+            new_hash = sha256_hex(new_raw)
             _write_hash_file(new_hash)
             self._pw_hash     = new_hash
             self._pw_user_set = True
@@ -817,6 +838,22 @@ class ServerBridge:
                         args=(rec.client_ip, new_hash),
                         daemon=True,
                     ).start()
+        
+        elif msg_type == MSG_RENAME:
+            if len(payload) < CLIENT_ID_LEN + 1:
+                return
+            snap_id  = payload[:CLIENT_ID_LEN].rstrip(b"\x00").decode("ascii", errors="replace")
+            new_name = payload[CLIENT_ID_LEN:CLIENT_ID_LEN + CLIENT_NAME_LEN].rstrip(b"\x00").decode("utf-8", errors="replace")
+            if not new_name:
+                return
+            rec = self._find_client(snap_id)
+            if rec:
+                old_name = rec.name
+                rec.name = new_name
+                log.info("Renamed %s -> %s", old_name, new_name)
+                if rec.connected():
+                    rec.ctrl_send({"type": "set_name", "name": new_name})
+                self._send_client_list()
 
         else:
             log.warning("Unknown ESP msg: 0x%02X", msg_type)
@@ -943,6 +980,13 @@ class ServerBridge:
     # ── Main loop ─────────────────────────────────────────────────────────
     def run(self):
         log.info("Server bridge starting — %s @ %d", self.ser.port, self.ser.baudrate)
+        if GPIO_AVAILABLE:
+            try:
+                subprocess.run(["gpioset", GPIO_CHIP, f"{GPIO_LED}=1"],
+                               timeout=3, capture_output=True)
+                log.info("LED GPIO%d ON", GPIO_LED)
+            except Exception as e:
+                log.warning("LED set failed: %s", e)
         self.snap.connect()
         threading.Thread(target=self._registration_listener, daemon=True).start()
         threading.Thread(target=self._keepalive_thread,      daemon=True).start()
