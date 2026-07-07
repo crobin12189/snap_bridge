@@ -71,7 +71,7 @@ PW_DEFAULT         = "anjay1234"
 GPIO_DSP   = 17
 GPIO_AMP   = 27
 GPIO_LED   = 26
-GPIO_DELAY = 10.0
+GPIO_DELAY = 30.0
 GPIO_CHIP  = "gpiochip0"
 
 _gpio_state: dict = {GPIO_DSP: False, GPIO_AMP: False}
@@ -982,6 +982,14 @@ class ClientBridge:
             powered = msg.get("powered", self.powered)
             threading.Thread(target=self._do_power_sequence,
                              args=(powered,), daemon=True).start()
+        elif mtype == "set_name":
+            new_name = msg.get("name", "")
+            if new_name:
+                threading.Thread(
+                    target=self._handle_rename,
+                    args=(new_name.encode(),),
+                    daemon=True
+                ).start()
 
     def _srv_send(self, msg: dict):
         with self._srv_lock:
@@ -990,6 +998,8 @@ class ClientBridge:
             return
         try:
             sock.sendall((json.dumps(msg) + "\n").encode())
+        except BlockingIOError:
+            log.warning("srv_send: send buffer busy, skipping this cycle")
         except Exception as e:
             log.warning("srv_send failed: %s", e)
             with self._srv_lock:
@@ -1078,14 +1088,13 @@ class ClientBridge:
             log.info("Power OFF: turning AMP off")
             gpio_set(GPIO_AMP, False)
             self.amp_on = False
-            self.broadcast_ctrl_state()
-            self.send_state(force=True)
+            self.send_state(force=True)     # update this zone's own ESP screen only
         time.sleep(GPIO_DELAY)
         if self.dsp_on:
             log.info("Power OFF: turning DSP off")
             gpio_set(GPIO_DSP, False)
             self.dsp_on = False
-            self.broadcast_ctrl_state()
+            self.broadcast_ctrl_state()     # ← now the ONLY point the server hears about it
             self.send_state(force=True)
 
     def _power_on_missing(self):
@@ -1349,13 +1358,15 @@ class ClientBridge:
             log.warning("RENAME: empty or invalid name, ignoring")
             return
         log.info("RENAME: setting hostname to '%s'", new_name)
+        self.hostname = new_name
+        self.send_state(force=True)
+        self.broadcast_ctrl_state()
+        threading.Thread(target=self._apply_rename_system, args=(new_name,), daemon=True).start()
+
+    def _apply_rename_system(self, new_name: str):
         try:
             subprocess.run(["sudo", "hostnamectl", "set-hostname", new_name],
-                           timeout=5, check=True, capture_output=True)
-
-            # Rebuild /etc/hosts with exactly one correct 127.0.1.1 entry,
-            # writing to a temp file then sudo-mv'ing it in (works regardless
-            # of whether this process itself runs as root).
+                        timeout=5, check=True, capture_output=True)
             try:
                 new_hosts_lines = []
                 found = False
@@ -1365,32 +1376,25 @@ class ClientBridge:
                             if not found:
                                 new_hosts_lines.append(f"127.0.1.1\t{new_name}\n")
                                 found = True
-                            # drop any duplicate stale 127.0.1.1 lines
                         else:
                             new_hosts_lines.append(line)
                 if not found:
                     new_hosts_lines.append(f"127.0.1.1\t{new_name}\n")
-
                 tmp_path = "/tmp/hosts.new"
                 with open(tmp_path, "w") as f:
                     f.writelines(new_hosts_lines)
                 subprocess.run(["sudo", "mv", tmp_path, "/etc/hosts"],
-                               timeout=5, check=True, capture_output=True)
+                            timeout=5, check=True, capture_output=True)
                 log.info("Updated /etc/hosts -> 127.0.1.1 %s", new_name)
             except (OSError, subprocess.CalledProcessError) as e:
                 log.warning("Could not update /etc/hosts: %s", e)
-
-            self.hostname = new_name
-
-            # Restart bluetooth so the adapter picks up the new name
             subprocess.run(["sudo", "systemctl", "restart", "bluetooth"],
-                           timeout=10, capture_output=True)
+                        timeout=10, capture_output=True)
             time.sleep(1)
             if self.mode == MODE_BT:
                 bt_agent_start()
                 if not self.bt_connected:
                     bt_start_discoverable()
-
             if self.mode == MODE_SYNC and snapclient_is_running():
                 snapclient_stop()
                 time.sleep(1)
@@ -1398,12 +1402,11 @@ class ClientBridge:
                 time.sleep(2)
                 self.client_id = None
                 self._last_rpc_attempt = 0.0
-
             self.send_state(force=True)
             self.broadcast_ctrl_state()
         except subprocess.CalledProcessError as e:
             log.error("hostnamectl failed: %s", e)
-
+            
     # ── RPC ───────────────────────────────────────────────────────────────
     def ensure_rpc(self):
         now = time.time()
