@@ -78,7 +78,7 @@ _gpio_state: dict = {GPIO_DSP: False, GPIO_AMP: False}
 
 REGISTER_RETRY_S = 5
 PING_TIMEOUT_S   = 15
-
+DISCONNECT_GRACE_S = 300
 
 def gpio_set(pin: int, state: bool):
     if not GPIO_AVAILABLE:
@@ -830,7 +830,10 @@ class ClientBridge:
         self.amp_on = False
 
         self._power_lock    = threading.Lock()
-        self._power_on_done = threading.Event()
+        self._server_online = threading.Event()   # set only while server TCP link is registered+alive
+        self._auto_power_lock = threading.Lock()   # guards the connect/disconnect auto power triggers
+        self._shutdown_timer_lock    = threading.Lock()  
+        self._shutdown_timer_running = False 
 
         self.rpc              = SnapcastRPC()
         self.client_id:  Optional[str] = None
@@ -881,7 +884,6 @@ class ClientBridge:
 
     # ── Server connection ──────────────────────────────────────────────────
     def _server_connect_loop(self):
-        self._power_on_done.wait()
         while self._running:
             try:
                 sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -901,13 +903,80 @@ class ClientBridge:
                 if h:
                     save_password_hash(h)
                     self._pw_hash = h
+
+                # Link is up and registered — only now is the zone allowed to power on.
+                self._server_online.set()
+                self._on_server_connected()
+
                 self._server_recv_loop(sock)
             except Exception as e:
                 log.warning("Server connect failed: %s — retry in %ds", e, REGISTER_RETRY_S)
                 with self._srv_lock:
                     self._srv_sock = None
+
+            # Whatever the reason (initial failure, ping timeout, recv error,
+            # clean close) — the link is down now. Gate power-on and force
+            # power-off if we were running.
+            self._server_online.clear()
+            self._on_server_disconnected()
             time.sleep(REGISTER_RETRY_S)
 
+    def _on_server_connected(self):
+        """Server link just became live+registered. Auto power-on if we're off."""
+        with self._auto_power_lock:
+            if self.powered:
+                log.info("Server reachable — zone already powered, nothing to do")
+                return
+            if self._power_lock.locked():
+                log.info("Server reachable — power sequence already running")
+                return
+            log.info("Server reachable — starting auto power-on sequence")
+            threading.Thread(target=self._do_power_sequence,
+                             args=(True,), daemon=True).start()
+
+    def _on_server_disconnected(self):
+        """
+        Server link just dropped. Instead of shutting off immediately, start a
+        grace-period timer — a brief network blip (Wi-Fi hiccup, switch reboot,
+        someone bumping a cable) shouldn't trigger a full 30s power-off/power-on
+        cycle. Only a sustained outage does.
+        """
+        with self._auto_power_lock:
+            if not self.powered:
+                log.info("Server unreachable — zone already off")
+                return
+        with self._shutdown_timer_lock:
+            if self._shutdown_timer_running:
+                return  # a countdown is already in progress from an earlier drop
+            self._shutdown_timer_running = True
+        threading.Thread(target=self._disconnect_shutdown_timer, daemon=True).start()
+
+    def _disconnect_shutdown_timer(self):
+        log.warning("Server unreachable — starting %ds grace period before auto power-off",
+                    DISCONNECT_GRACE_S)
+        try:
+            deadline = time.time() + DISCONNECT_GRACE_S
+            while time.time() < deadline:
+                if self._server_online.is_set():
+                    log.info("Server reachable again — auto power-off cancelled")
+                    return
+                time.sleep(1.0)
+
+            if self._server_online.is_set():
+                log.info("Server reconnected right at grace-period end — auto power-off cancelled")
+                return
+
+            with self._auto_power_lock:
+                if not self.powered:
+                    log.info("Server still unreachable after grace period — zone already off")
+                    return
+                log.warning("Server unreachable for %ds — forcing auto power-off sequence",
+                            DISCONNECT_GRACE_S)
+                self._do_power_sequence(False)   # ← call directly, no new thread — block until done
+        finally:
+            with self._shutdown_timer_lock:
+                self._shutdown_timer_running = False
+                
     def _send_register(self, sock: socket.socket):
         reg = {
             "type":           "register",
@@ -1022,6 +1091,9 @@ class ClientBridge:
 
     def _broadcast_power(self):
         self._srv_send({"type": "power_state", "powered": self.powered})
+    
+    def _broadcast_power_pending(self, target: bool):
+        self._srv_send({"type": "power_pending", "target": target})
 
     def _broadcast_switching(self):
         self._srv_send({"type": "switching"})
@@ -1063,25 +1135,11 @@ class ClientBridge:
         self.send_frame(MSG_STATE_UPDATE, payload)
 
     # ── Relay helpers ──────────────────────────────────────────────────────
-    def _power_on_sequence(self):
-        with self._power_lock:
-            log.info("Power ON: turning DSP on")
-            gpio_set(GPIO_DSP, True)
-            self.dsp_on = True
-        # Broadcast DSP=on immediately so ESP/server see it light up
-        self.broadcast_ctrl_state()
-        self._broadcast_power()
-        self.send_state(force=True)
-        time.sleep(GPIO_DELAY)
-        with self._power_lock:
-            log.info("Power ON: turning AMP on")
-            gpio_set(GPIO_AMP, True)
-            self.amp_on = True
-            log.info("Power ON: complete — powered=%s", self.powered)
-        self._power_on_done.set()
-        self.broadcast_ctrl_state()
-        self._broadcast_power()
-        self.send_state(force=True)
+    # NOTE: the old unconditional _power_on_sequence() (fired once at boot,
+    # regardless of server reachability) has been removed. Power-on now only
+    # ever happens via _on_server_connected() -> _do_power_sequence(True) ->
+    # _power_on_missing() below, i.e. only once the server link is up and
+    # registered.
 
     def _power_off_all(self):
         if self.amp_on:
@@ -1169,6 +1227,7 @@ class ClientBridge:
             return
         try:
             log.info("Power sequence: %s", "ON" if powered else "OFF")
+            self._broadcast_power_pending(powered)
             if powered:
                 self._power_lock.release()
                 self._power_on_missing()
@@ -1618,7 +1677,9 @@ class ClientBridge:
         log.info("Client bridge — %s @ %d — hostname: %s",
                  self.ser.port, self.ser.baudrate, self.hostname)
 
-        threading.Thread(target=self._power_on_sequence, daemon=True).start()
+        # Power stays OFF until the server link is up and registered.
+        # _server_connect_loop() calls _on_server_connected() the moment
+        # that happens, which is what actually starts the power-on sequence.
         threading.Thread(target=self._server_connect_loop, daemon=True).start()
 
         self.enter_sync_mode()
@@ -1680,7 +1741,6 @@ def main():
         log.info("Shutting down")
         bridge.rpc.disconnect()
         gpio_cleanup()
-
 
 if __name__ == "__main__":
     main()
