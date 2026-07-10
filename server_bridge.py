@@ -8,6 +8,7 @@ import threading
 import time
 import hashlib
 import os
+import re
 from typing import Optional
 
 import serial
@@ -30,7 +31,7 @@ MSG_MODE_BT         = 0x06
 MSG_POWER_SET       = 0x07
 MSG_RESTART_SERVER  = 0x09
 MSG_INPUT_SET       = 0x0A   # 0=usb, 1=mic
-MSG_INPUT_SET       = 0x0A   # 0=usb, 1=mic
+MSG_MIC_GAIN_SET    = 0x0B
 MSG_ACK             = 0x10
 MSG_CLIENT_LIST     = 0x11
 MSG_CLIENT_VOL_UPD  = 0x12
@@ -38,6 +39,8 @@ MSG_PONG            = 0x13
 MSG_STATE_UPDATE    = 0x20
 MSG_MODE_SWITCHING  = 0x21
 MSG_POWER_STATE     = 0x22
+MSG_POWER_PENDING   = 0x23 
+MSG_MIC_STATUS      = 0x24
 MSG_PW_SET          = 0x30
 MSG_RENAME          = 0x33  # add at top with other constants
 MSG_PW_ACK          = 0x34
@@ -47,7 +50,7 @@ MODE_BT   = 1
 
 CLIENT_ID_LEN     = 36
 CLIENT_NAME_LEN   = 32
-CLIENT_ENTRY_SIZE = CLIENT_ID_LEN + CLIENT_NAME_LEN + 6
+CLIENT_ENTRY_SIZE = CLIENT_ID_LEN + CLIENT_NAME_LEN + 8
 
 CTRL_PORT         = 7702
 PW_HASH_FILE      = "/etc/zone_password.hash"
@@ -80,6 +83,33 @@ def build_frame(msg_type: int, payload: bytes = b"") -> bytes:
     crc_data = bytes([msg_type, plen & 0xFF, (plen >> 8) & 0xFF]) + payload
     return header + payload + bytes([crc8(crc_data)])
 
+def _find_mic_source() -> Optional[str]:
+    """Same selection rule as snapcast-sourcemic.service's DEVICE lookup."""
+    try:
+        result = subprocess.run(["pactl", "list", "sources", "short"],
+                                capture_output=True, text=True, timeout=5)
+        for line in result.stdout.splitlines():
+            parts = line.split()
+            if len(parts) < 2:
+                continue
+            name = parts[1]
+            if "alsa_input" in name and "monitor" not in name and "platform-" not in name:
+                return name
+    except Exception as e:
+        log.warning("_find_mic_source error: %s", e)
+    return None
+
+
+def _get_mic_gain(source: str) -> Optional[int]:
+    try:
+        result = subprocess.run(["pactl", "get-source-volume", source],
+                                capture_output=True, text=True, timeout=3)
+        m = re.search(r"(\d+)%", result.stdout)
+        if m:
+            return int(m.group(1))
+    except Exception as e:
+        log.warning("_get_mic_gain error: %s", e)
+    return None
 
 class HashPullServer(threading.Thread):
     def __init__(self, get_hash_fn):
@@ -261,6 +291,8 @@ class ClientRecord:
         self.snap_connected = False
         self.mode           = MODE_SYNC
         self.powered        = False
+        self.power_pending  = False 
+        self.power_target   = False  
         self.bt_connected   = False
         self.bt_dev_name    = ""
         self.client_ip      = ""
@@ -306,6 +338,19 @@ class ClientRecord:
                     pass
                 self._sock = None
 
+    def disconnect_if(self, sock) -> bool:
+        """Only closes/clears if `sock` is still this record's active socket.
+        Returns True if it actually cleaned up (i.e. this was the live session)."""
+        with self._sock_lock:
+            if self._sock is sock:
+                try:
+                    self._sock.close()
+                except Exception:
+                    pass
+                self._sock = None
+                return True
+            return False
+        
     def connected(self) -> bool:
         with self._sock_lock:
             return self._sock is not None
@@ -355,6 +400,8 @@ def _broadcast_hash_to_one(ip: str, h: str):
 class ServerBridge:
     ESP_TIMEOUT_S          = 20
     SNAP_HEALTH_INTERVAL_S = 10
+    MIC_CHECK_INTERVAL_S   = 2
+    CLIENT_LIST_RESEND_S   = 5
 
     def __init__(self, serial_port, baud, snap_host, snap_port):
         self.ser  = serial.Serial(serial_port, baud, timeout=0.05)
@@ -367,10 +414,13 @@ class ServerBridge:
         self._esp_connected        = False
         self._last_esp_msg_time    = time.time()
         self._last_snap_health     = time.time()
+        self._last_client_list_send = 0.0
         self._esp_vol_set_time     = {}
         self._running              = True
         self._input_mode           = 0  # 0=usb 1=mic; default usb, both services start disabled
-        self._input_mode           = 0  # 0=usb, 1=mic
+        self._mic_present          = False   # ← add
+        self._mic_gain              = 50     # ← add
+        self._last_mic_check        = 0.0    # ← add
 
         self._pw_hash, self._pw_user_set = load_or_init_password()
         self._hash_pull_server = HashPullServer(lambda: self._pw_hash)
@@ -517,8 +567,11 @@ class ServerBridge:
         except Exception as e:
             log.warning("Client %s session error: %s", rec.name, e)
         finally:
-            rec.disconnect()
-            self._on_client_gone(rec)
+            was_active = rec.disconnect_if(sock)
+            if was_active:
+                self._on_client_gone(rec)
+            else:
+                log.info("Stale session for %s closed (already superseded by a newer connection)", rec.name)
 
     def _send_single_state(self, rec: ClientRecord):
         time.sleep(0.3)
@@ -593,10 +646,13 @@ class ServerBridge:
                               rec.mode,
                               1 if rec.powered        else 0,
                               1 if rec.bt_connected   else 0,
+                              1 if rec.power_pending  else 0,
+                              1 if rec.power_target   else 0,
                           ]))
         return payload
 
     def _send_client_list(self):
+        self._last_client_list_send = time.time()
         payload = self._build_client_list_payload()
         self.send_frame(MSG_CLIENT_LIST, payload)
         log.info("Sent CLIENT_LIST with %d clients", payload[0])
@@ -652,15 +708,18 @@ class ServerBridge:
                         if rec is None:
                             continue
 
-                    rec.name           = name
-                    rec.muted          = muted
+                    rec.name  = name
+                    rec.muted = muted
+
+                    just_connected = connected and not rec.snap_connected
                     if rec.snap_connected != connected:
                         changed = True
                     rec.snap_connected = connected
-                    if rec.mode == MODE_SYNC:
+
+                    if rec.mode == MODE_SYNC and just_connected:
                         rec.volume = volume
         return changed
-
+    
     # ── Control message handler ───────────────────────────────────────────
     def _on_ctrl_message(self, rec: ClientRecord, msg: dict):
         mtype = msg.get("type", "")
@@ -711,9 +770,19 @@ class ServerBridge:
         elif mtype == "power_state":
             powered = msg.get("powered", rec.powered)
             rec.powered = powered
+            if rec.power_pending and powered == rec.power_target:   #
+                rec.power_pending = False    
             if self._esp_connected:
                 self.send_frame(MSG_POWER_STATE,
                                 self._id_bytes(rec.snap_id) + bytes([1 if powered else 0]))
+        
+        elif mtype == "power_pending":                 
+            target = msg.get("target", rec.powered)
+            rec.power_pending = True  
+            rec.power_target  = target
+            if self._esp_connected:
+                self.send_frame(MSG_POWER_PENDING,
+                                self._id_bytes(rec.snap_id) + bytes([1 if target else 0]))
 
     # ── ESP message handlers ──────────────────────────────────────────────
     def handle_esp_message(self, msg_type: int, payload: bytes):
@@ -795,18 +864,8 @@ class ServerBridge:
                 args=(mode,),
                 daemon=True,
             ).start()
-
-        elif msg_type == MSG_INPUT_SET:
-            if len(payload) < 1:
-                return
-            mode = payload[0]  # 0=usb, 1=mic
-            self._input_mode = mode
-            log.info("Input mode set: %s", "mic" if mode else "usb")
-            threading.Thread(
-                target=self._apply_input_mode,
-                args=(mode,),
-                daemon=True,
-            ).start()
+            if mode == 1:
+                threading.Thread(target=self._poll_mic_status, args=(True,), daemon=True).start()  # ← add
 
         elif msg_type == MSG_RESTART_SERVER:
             log.info("ESP requested snapserver restart")
@@ -854,6 +913,23 @@ class ServerBridge:
                 if rec.connected():
                     rec.ctrl_send({"type": "set_name", "name": new_name})
                 self._send_client_list()
+        
+        elif msg_type == MSG_MIC_GAIN_SET:
+            if len(payload) < 1:
+                return
+            gain = payload[0]
+            source = _find_mic_source()
+            if source:
+                try:
+                    subprocess.run(["pactl", "set-source-volume", source, f"{gain}%"],
+                                timeout=3, capture_output=True)
+                    self._mic_gain = gain
+                    log.info("Mic gain set via ESP: %d%%", gain)
+                except Exception as e:
+                    log.error("Mic gain set failed: %s", e)
+            else:
+                log.warning("MIC_GAIN_SET received but no mic source found")
+            self._poll_mic_status(force=True)
 
         else:
             log.warning("Unknown ESP msg: 0x%02X", msg_type)
@@ -893,31 +969,7 @@ class ServerBridge:
 
     # ── Input mode switch ────────────────────────────────────────────────
     def _apply_input_mode(self, mode: int):
-        """Switch audio input: 0=USB/UAC, 1=mic."""
-        try:
-            if mode == 0:
-                subprocess.run(["sudo", "systemctl", "stop",  "snapcast-sourcemic"],
-                               timeout=5, check=False, capture_output=True)
-                subprocess.run(["sudo", "systemctl", "start", "snapcast-source"],
-                               timeout=5, check=False, capture_output=True)
-                log.info("Input switched to USB/UAC")
-            else:
-                subprocess.run(["sudo", "systemctl", "stop",  "snapcast-source"],
-                               timeout=5, check=False, capture_output=True)
-                subprocess.run(["sudo", "systemctl", "start", "snapcast-sourcemic"],
-                               timeout=5, check=False, capture_output=True)
-                log.info("Input switched to mic")
-        except Exception as e:
-            log.error("Input mode switch failed: %s", e)
-
-    # ── Input mode switch ────────────────────────────────────────────────
-    def _apply_input_mode(self, mode: int):
-        """
-        Switch audio input source.
-        mode=0 (USB/UAC): stop snapcast-sourcemic, start snapcast-source.
-        mode=1 (mic):     stop snapcast-source,    start snapcast-sourcemic.
-        Both services are disabled at boot — this is the only thing that starts them.
-        """
+        """Switch audio input source."""
         try:
             if mode == 0:
                 log.info("Switching input to USB/UAC")
@@ -935,6 +987,24 @@ class ServerBridge:
                 log.info("Input: mic active")
         except Exception as e:
             log.error("Input mode switch failed: %s", e)
+    
+    def _poll_mic_status(self, force: bool = False):
+        source  = _find_mic_source()
+        present = source is not None
+        gain    = self._mic_gain
+        if present:
+            g = _get_mic_gain(source)
+            if g is not None:
+                gain = g
+        changed = (present != self._mic_present) or (gain != self._mic_gain)
+        self._mic_present = present
+        self._mic_gain    = gain
+        if (changed or force) and self._esp_connected:
+            self._send_mic_status()
+
+    def _send_mic_status(self):
+        self.send_frame(MSG_MIC_STATUS,
+                        bytes([1 if self._mic_present else 0, self._mic_gain & 0xFF]))
 
     # ── Restart Snapserver ────────────────────────────────────────────────
     def _restart_snapserver(self):
@@ -1024,6 +1094,17 @@ class ServerBridge:
                     self._snap_reconnect()
                 except Exception as e:
                     log.error("Snap notification error: %s", e)
+
+            if self._esp_connected:
+                now_mic = time.time()
+                if self._input_mode == 1 and now_mic - self._last_mic_check >= self.MIC_CHECK_INTERVAL_S:
+                    self._last_mic_check = now_mic
+                    self._poll_mic_status()
+            
+            if self._esp_connected:
+                now_list = time.time()
+                if now_list - self._last_client_list_send >= self.CLIENT_LIST_RESEND_S:
+                    self._send_client_list()
 
 
 def main():
