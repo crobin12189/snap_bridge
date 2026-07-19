@@ -840,6 +840,7 @@ class ClientBridge:
         self._snap_server_ip: Optional[str] = None
         self._esp_vol_set_time = 0.0
         self._last_rpc_attempt = 0.0
+        self._client_id_ever_resolved = False
 
         self.bt_connected  = False
         self.bt_dev_name   = ""
@@ -1485,10 +1486,17 @@ class ClientBridge:
         if not self.client_id:
             self.client_id = self.rpc.find_client_id_by_hostname(self.hostname)
             if self.client_id:
-                self.volume = 0
-                self.rpc.set_volume(self.client_id, 0)
+                if not self._client_id_ever_resolved:
+                    self._client_id_ever_resolved = True
+                    self.volume = 0
+                    self.rpc.set_volume(self.client_id, 0)
+                    self.send_vol_update(0)
+                else:
+                    vol = self.rpc.get_volume_for_client(self.client_id)
+                    if vol is not None:
+                        self.volume = vol
+                    self.send_vol_update(self.volume)
                 self.send_state(force=True)
-                self.send_vol_update(0)
                 self.broadcast_ctrl_state()
 
     # ── Mode transitions ──────────────────────────────────────────────────
@@ -1667,6 +1675,10 @@ class ClientBridge:
                         self.volume = vol
                         self.send_vol_update(vol)
             elif method in ("Client.OnConnect", "Client.OnDisconnect"):
+                params = n.get("params", {})
+                event_id = params.get("id") or params.get("client", {}).get("id")
+                if event_id is not None and event_id != self.client_id:
+                    continue  # some other zone connected/disconnected — not about us
                 self.client_id = None
                 self._last_rpc_attempt = 0.0
                 self.send_state(force=True)
