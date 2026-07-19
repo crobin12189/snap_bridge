@@ -302,6 +302,8 @@ class ClientRecord:
         self._last_pong = time.time()
         self._ping_misses = 0
 
+        self.pending_power: Optional[bool] = None   # queued power command waiting for reconnect
+
     def set_sock(self, sock: socket.socket, addr):
         with self._sock_lock:
             if self._sock:
@@ -532,6 +534,11 @@ class ServerBridge:
         rec.snap_connected = msg.get("snap_connected", False)
         rec.bt_connected   = msg.get("bt_connected",   False)
         rec.powered        = msg.get("powered",        False)
+
+        if rec.pending_power is not None:
+            log.info("Delivering queued power=%s to %s on reconnect", rec.pending_power, rec.name)
+            rec.ctrl_send({"type": "set_powered", "powered": rec.pending_power})
+            rec.pending_power = None
 
         log.info("Registered %s: mode=%d vol=%d powered=%s",
                  name, rec.mode, rec.volume, rec.powered)
@@ -847,11 +854,17 @@ class ServerBridge:
             snap_id = payload[:CLIENT_ID_LEN].rstrip(b"\x00").decode("ascii", errors="replace")
             powered = payload[CLIENT_ID_LEN] != 0
             rec = self._find_client(snap_id)
-            if rec and rec.connected():
-                rec.ctrl_send({"type": "set_powered", "powered": powered})
-                log.info("Power -> %s sent to %s", powered, rec.name)
+            if rec:
+                if rec.connected():
+                    rec.ctrl_send({"type": "set_powered", "powered": powered})
+                    rec.pending_power = None
+                    log.info("Power -> %s sent to %s", powered, rec.name)
+                else:
+                    rec.pending_power = powered
+                    log.warning("No control connection to %s — queued power=%s for delivery on reconnect",
+                                snap_id, powered)
             else:
-                log.warning("No control connection to %s", snap_id)
+                log.warning("Unknown client %s for power command", snap_id)
 
         elif msg_type == MSG_INPUT_SET:
             if len(payload) < 1:
