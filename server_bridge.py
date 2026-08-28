@@ -1031,8 +1031,8 @@ class ServerBridge:
         USB/mic pipelines which write directly to the FIFO via ALSA, bypassing
         PulseAudio entirely. Only the active source service changes.
         """
-        if not self._input_mode_lock.acquire(blocking=False):
-            log.warning("Input mode switch already in progress — skipping duplicate call")
+        if not self._input_mode_lock.acquire(blocking=True, timeout=30):
+            log.error("Input mode switch timed out waiting for lock — skipping")
             return
         try:
             if mode == INPUT_USB:
