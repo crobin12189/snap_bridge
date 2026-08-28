@@ -829,7 +829,10 @@ class ClientBridge:
         self.dsp_on = False
         self.amp_on = False
 
-        self._power_lock    = threading.Lock()
+        self._power_lock           = threading.Lock()
+        self._power_seq_state_lock = threading.Lock()
+        self._power_seq_active     = False
+        self._power_seq_target: Optional[bool] = None
         self._server_online = threading.Event()   # set only while server TCP link is registered+alive
         self._auto_power_lock = threading.Lock()   # guards the connect/disconnect auto power triggers
         self._shutdown_timer_lock    = threading.Lock()  
@@ -928,12 +931,9 @@ class ClientBridge:
             if self.powered:
                 log.info("Server reachable — zone already powered, nothing to do")
                 return
-            if self._power_lock.locked():
-                log.info("Server reachable — power sequence already running")
-                return
-            log.info("Server reachable — starting auto power-on sequence")
+            log.info("Server reachable — starting/queuing auto power-on sequence")
             threading.Thread(target=self._do_power_sequence,
-                             args=(True,), daemon=True).start()
+                            args=(True,), daemon=True).start()
 
     def _on_server_disconnected(self):
         """
@@ -968,6 +968,9 @@ class ClientBridge:
                 return
 
             with self._auto_power_lock:
+                if self._server_online.is_set():
+                    log.info("Server reconnected — auto power-off cancelled")
+                    return
                 if not self.powered:
                     log.info("Server still unreachable after grace period — zone already off")
                     return
@@ -1157,23 +1160,21 @@ class ClientBridge:
             self.send_state(force=True)
 
     def _power_on_missing(self):
-        with self._power_lock:
-            if not self.dsp_on:
-                log.info("Power ON: turning DSP on")
-                gpio_set(GPIO_DSP, True)
-                self.dsp_on = True
-            else:
-                log.info("Power ON: DSP already on")
+        if not self.dsp_on:
+            log.info("Power ON: turning DSP on")
+            gpio_set(GPIO_DSP, True)
+            self.dsp_on = True
+        else:
+            log.info("Power ON: DSP already on")
         # Broadcast DSP state immediately before the delay
         self.broadcast_ctrl_state()
         self._broadcast_power()
         self.send_state(force=True)
         if not self.amp_on:
             time.sleep(GPIO_DELAY)
-            with self._power_lock:
-                log.info("Power ON: turning AMP on")
-                gpio_set(GPIO_AMP, True)
-                self.amp_on = True
+            log.info("Power ON: turning AMP on")
+            gpio_set(GPIO_AMP, True)
+            self.amp_on = True
             log.info("Power ON: complete — powered=%s", self.powered)
             self.broadcast_ctrl_state()
             self._broadcast_power()
@@ -1223,36 +1224,45 @@ class ClientBridge:
 
     # ── Power sequences ────────────────────────────────────────────────────
     def _do_power_sequence(self, powered: bool):
-        if not self._power_lock.acquire(blocking=False):
-            log.warning("Power sequence already in progress")
-            return
-        try:
-            log.info("Power sequence: %s", "ON" if powered else "OFF")
-            self._broadcast_power_pending(powered)
-            if powered:
-                self._power_lock.release()
-                self._power_on_missing()
-                self._start_audio()
+        with self._power_seq_state_lock:
+            self._power_seq_target = powered
+            if self._power_seq_active:
+                log.info("Power sequence already running — new target (%s) queued", powered)
                 return
-            else:
-                self._power_off_all()
-                self._stop_audio()
-            self.broadcast_ctrl_state()
-            self._broadcast_power()
-            self.send_state(force=True)
-        finally:
-            if self._power_lock.locked():
-                self._power_lock.release()
+            self._power_seq_active = True
+
+        try:
+            while True:
+                with self._power_seq_state_lock:
+                    target = self._power_seq_target
+
+                with self._power_lock:
+                    log.info("Power sequence: %s", "ON" if target else "OFF")
+                    self._broadcast_power_pending(target)
+                    if target:
+                        self._power_on_missing()
+                        self._start_audio()
+                    else:
+                        self._power_off_all()
+                        self._stop_audio()
+                    self.broadcast_ctrl_state()
+                    self._broadcast_power()
+                    self.send_state(force=True)
+
+                with self._power_seq_state_lock:
+                    if self._power_seq_target == target:
+                        self._power_seq_active = False
+                        return
+                    # target changed mid-sequence — loop and run it again
+        except Exception:
+            with self._power_seq_state_lock:
+                self._power_seq_active = False
+            raise
 
     def _do_dsp_sequence(self, on: bool):
-        if not self._power_lock.acquire(blocking=False):
-            log.warning("Power sequence already in progress")
-            return
-        try:
+        with self._power_lock:
             gpio_set(GPIO_DSP, on)
             self.dsp_on = gpio_get(GPIO_DSP)
-        finally:
-            self._power_lock.release()
         log.info("DSP -> %s, powered=%s", on, self.powered)
         if not self.powered:
             self._stop_audio()
@@ -1263,14 +1273,9 @@ class ClientBridge:
         self.send_state(force=True)
 
     def _do_amp_sequence(self, on: bool):
-        if not self._power_lock.acquire(blocking=False):
-            log.warning("Power sequence already in progress")
-            return
-        try:
+        with self._power_lock:
             gpio_set(GPIO_AMP, on)
             self.amp_on = gpio_get(GPIO_AMP)
-        finally:
-            self._power_lock.release()
         log.info("AMP -> %s, powered=%s", on, self.powered)
         if not self.powered:
             self._stop_audio()
