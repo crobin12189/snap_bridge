@@ -185,7 +185,7 @@ ExecStart=/bin/bash -c '\\
             sleep 1; \\
         fi; \\
     done'
-Restart=always
+Restart=on-failure
 RestartSec=2
  
 [Install]
@@ -220,7 +220,7 @@ ExecStart=/bin/bash -c '\\
             sleep 1; \\
         fi; \\
     done'
-Restart=always
+Restart=on-failure
 RestartSec=2
  
 [Install]
@@ -228,13 +228,14 @@ WantedBy=multi-user.target
 SVCEOF
  
 # ── snapcast-sourcebt (BT → FIFO) — new addition ──
-# Same pattern as above. Bridge loads PA loopback from BT A2DP source
-# to bt_snapcast_sink when phone connects; parec reads from that sink monitor.
+# Same pattern as USB and mic services above — finds bluez_source.* directly
+# via pactl (PipeWire compatibility layer) and pipes straight to FIFO.
+# No PulseAudio daemon or null-sink needed — PipeWire handles BT A2DP natively.
 cat > /etc/systemd/system/snapcast-sourcebt.service << SVCEOF
 [Unit]
-Description=PulseAudio BT audio source to Snapcast FIFO
-After=pulseaudio.service snapserver.service bt-agent.service
-Wants=pulseaudio.service
+Description=PipeWire BT audio source to Snapcast FIFO
+After=pipewire.service snapserver.service bt-agent.service
+Wants=pipewire.service
  
 [Service]
 Type=simple
@@ -243,9 +244,10 @@ Environment=XDG_RUNTIME_DIR=/run/user/$USER_ID
 ExecStartPre=/bin/bash -c 'test -p /tmp/snapfifo || mkfifo /tmp/snapfifo'
 ExecStart=/bin/bash -c '\\
     while true; do \\
-        if pactl list sinks short 2>/dev/null | grep -q "bt_snapcast_sink"; then \\
+        DEVICE=\$(pactl list sources short | grep "bluez_source" | grep -v monitor | awk "{print \\\$2}" | head -1); \\
+        if [ -n "\$DEVICE" ]; then \\
             parec \\
-                --device=bt_snapcast_sink.monitor \\
+                --device=\$DEVICE \\
                 --format=s32le \\
                 --rate=96000 \\
                 --channels=2 \\
@@ -256,7 +258,7 @@ ExecStart=/bin/bash -c '\\
             sleep 1; \\
         fi; \\
     done'
-Restart=always
+Restart=on-failure
 RestartSec=2
  
 [Install]
@@ -268,57 +270,7 @@ systemctl disable snapcast-source    2>/dev/null || true
 systemctl disable snapcast-sourcemic 2>/dev/null || true
 systemctl disable snapcast-sourcebt  2>/dev/null || true
 
-# ── 8. PulseAudio — user mode, 96kHz/32-bit ───────────────────────────────
-echo ""
-echo "[8/14] Configuring PulseAudio..."
-
-# Remove any stale custom config to avoid duplicates
-sed -i '/^# Server BT audio config$/,/^resample-method/d' /etc/pulse/daemon.conf
-
-cat >> /etc/pulse/daemon.conf << 'EOF'
-
-# Server BT audio config
-default-sample-format = s32le
-default-sample-rate = 96000
-alternate-sample-rate = 48000
-default-sample-channels = 2
-resample-method = speex-float-5
-EOF
-
-# Disable autospawn — bridge controls PA start/stop for BT mode
-echo "autospawn = no" >> /etc/pulse/client.conf
-
-# Create null sink for BT routing in default.pa.
-# This sink is always available when PA is running.
-# The bridge loads module-loopback from the BT A2DP source to this sink.
-grep -q "bt_snapcast_sink" /etc/pulse/default.pa || \
-    cat >> /etc/pulse/default.pa << 'EOF'
-
-# Null sink for routing BT A2DP audio to snapserver FIFO
-load-module module-null-sink sink_name=bt_snapcast_sink \
-    sink_properties=device.description="BT_Snapcast_Input"
-EOF
-
-# Remove loopback from default.pa — bridge manages it
-sed -i '/module-loopback/d' /etc/pulse/default.pa
-
-# Disable PipeWire if present
-sudo -u "$REAL_USER" systemctl --user disable \
-    pipewire.service pipewire.socket \
-    pipewire-pulse.service pipewire-pulse.socket \
-    wireplumber.service 2>/dev/null || true
-sudo -u "$REAL_USER" systemctl --user mask \
-    pipewire.service pipewire.socket \
-    pipewire-pulse.service pipewire-pulse.socket \
-    wireplumber.service 2>/dev/null || true
-
-sudo -u "$REAL_USER" systemctl --user unmask pulseaudio.service pulseaudio.socket 2>/dev/null || true
-# PA starts only when bridge enables BT mode — do NOT enable at boot
-sudo -u "$REAL_USER" systemctl --user disable pulseaudio.service pulseaudio.socket 2>/dev/null || true
-
-loginctl enable-linger "$REAL_USER"
-
-# ── 9. Bluetooth — USB dongle + auto-pair agent ───────────────────────────
+# ── 8. Bluetooth — USB dongle + auto-pair agent ───────────────────────────
 echo ""
 echo "[9/14] Configuring Bluetooth..."
 
@@ -366,6 +318,7 @@ import dbus.service
 import dbus.mainloop.glib
 from gi.repository import GLib
 import logging
+import socket
 import time
 import threading
 
@@ -407,7 +360,7 @@ class BTAgent(dbus.service.Object):
 
     @dbus.service.method("org.bluez.Agent1", in_signature="ouq", out_signature="")
     def DisplayPasskey(self, device, passkey, entered):
-        log.info("DisplayPasskey: %s passkey=%d entered=%d", device, passkey, entered)
+        log.info("DisplayPasskey: %s passkey=%06d entered=%d", device, passkey, entered)
 
     @dbus.service.method("org.bluez.Agent1", in_signature="os", out_signature="")
     def DisplayPinCode(self, device, pincode):
@@ -415,7 +368,7 @@ class BTAgent(dbus.service.Object):
 
     @dbus.service.method("org.bluez.Agent1", in_signature="ou", out_signature="")
     def RequestConfirmation(self, device, passkey):
-        log.info("RequestConfirmation: %s passkey=%d — auto-confirmed", device, passkey)
+        log.info("RequestConfirmation: %s passkey=%06d — auto-confirmed", device, passkey)
 
     @dbus.service.method("org.bluez.Agent1", in_signature="o", out_signature="")
     def RequestAuthorization(self, device):
@@ -441,12 +394,15 @@ def setup_adapter(bus):
         log.error("No Bluetooth adapter found!")
         return False
     try:
-        props.Set(ADAPTER_IFACE, "Powered",              dbus.Boolean(True))
-        props.Set(ADAPTER_IFACE, "Discoverable",         dbus.Boolean(True))
-        props.Set(ADAPTER_IFACE, "DiscoverableTimeout",  dbus.UInt32(0))
-        props.Set(ADAPTER_IFACE, "Pairable",             dbus.Boolean(True))
-        props.Set(ADAPTER_IFACE, "PairableTimeout",      dbus.UInt32(0))
-        log.info("Adapter %s: powered=on, discoverable=on, pairable=on", path)
+        hostname = socket.gethostname()
+        props.Set(ADAPTER_IFACE, "Alias",             dbus.String(hostname))
+        props.Set(ADAPTER_IFACE, "Powered",           dbus.Boolean(True))
+        props.Set(ADAPTER_IFACE, "Discoverable",      dbus.Boolean(True))
+        props.Set(ADAPTER_IFACE, "DiscoverableTimeout", dbus.UInt32(0))
+        props.Set(ADAPTER_IFACE, "Pairable",          dbus.Boolean(True))
+        props.Set(ADAPTER_IFACE, "PairableTimeout",   dbus.UInt32(0))
+        log.info("Adapter %s: name=%s powered=on discoverable=on pairable=on",
+                 path, hostname)
         return True
     except Exception as e:
         log.error("Adapter setup failed: %s", e)
@@ -585,9 +541,7 @@ Type=simple
 User=$REAL_USER
 ExecStart=/usr/bin/python3 ${BRIDGE_DIR}/server_bridge.py \
     --port /dev/ttyAMA0 \
-    --baud 460800 \
-    --pa-user $REAL_USER \
-    --pa-uid $USER_ID
+    --baud 460800
 Restart=always
 RestartSec=3
 Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/${USER_ID}/bus
