@@ -121,40 +121,34 @@ echo "[6/14] Configuring Snapserver..."
 
 SNAPFIFO="/tmp/snapfifo"
 
-cat > /etc/snapserver.conf << EOF
+cat > /etc/snapserver.conf << 'EOF'
 [server]
-threads = -1
+
+[http]
+
+[tcp]
 
 [stream]
-source = pipe://${SNAPFIFO}?name=default&mode=read
-buffer = 1000
-codec = flac
+bind_to_address = 0.0.0.0
+port = 1704
+source = pipe:///tmp/snapfifo?name=USB_Audio&dryout_ms=2000
 sampleformat = 96000:32:2
+codec = flac
+chunk_ms = 40
+buffer = 1500
 
 [logging]
-filter = *:info
+EOF
+
+# Create the FIFO now and make it persistent across reboots
+test -p /tmp/snapfifo || mkfifo /tmp/snapfifo
+chmod 666 /tmp/snapfifo
+
+cat > /etc/tmpfiles.d/snapfifo.conf << 'EOF'
+p /tmp/snapfifo 0666 root root -
 EOF
 
 systemctl enable snapserver
-
-# Snapserver needs the FIFO to exist before it starts
-cat > /etc/systemd/system/snapfifo-create.service << EOF
-[Unit]
-Description=Create Snapcast FIFO
-Before=snapserver.service
-
-[Service]
-Type=oneshot
-ExecStart=/usr/bin/mkfifo ${SNAPFIFO}
-ExecStart=/bin/chmod 666  ${SNAPFIFO}
-RemainAfterExit=yes
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-systemctl daemon-reload
-systemctl enable snapfifo-create.service
 
 # ── 7. Source services (all disabled at boot — bridge controls them) ───────
 echo ""
@@ -163,144 +157,116 @@ echo "[7/14] Installing Snapcast source services..."
 BRIDGE_DIR="/opt/esp-bridge"
 mkdir -p "$BRIDGE_DIR"
 
-# ── snapcast-source (USB UAC → FIFO) ──
-# The DEVICE pattern matches the UAC ALSA capture created by g_audio.
-cat > "$BRIDGE_DIR/uac_source.sh" << 'EOF'
-#!/bin/bash
-# USB/UAC source: reads from the g_audio ALSA capture device and feeds snapserver FIFO.
-FIFO="/tmp/snapfifo"
-RATE=96000
-CHANNELS=2
-FORMAT=S32_LE
-
-# Wait for the ALSA device to appear (UAC gadget may take a moment after phone connects)
-for i in $(seq 1 30); do
-    DEVICE=$(arecord -l 2>/dev/null | awk '/UAC|USB Audio|g_audio/{print $2}' | head -1 | tr -d ':')
-    [ -n "$DEVICE" ] && break
-    sleep 1
-done
-
-if [ -z "$DEVICE" ]; then
-    echo "UAC ALSA capture device not found" >&2
-    exit 1
-fi
-
-echo "UAC source: using device hw:${DEVICE},0"
-exec arecord -D "hw:${DEVICE},0" -f "$FORMAT" -r "$RATE" -c "$CHANNELS" -t raw > "$FIFO"
-EOF
-chmod +x "$BRIDGE_DIR/uac_source.sh"
-
-cat > /etc/systemd/system/snapcast-source.service << EOF
+# ── snapcast-source (USB UAC → FIFO) — original unchanged ──
+cat > /etc/systemd/system/snapcast-source.service << SVCEOF
 [Unit]
-Description=Snapcast source — USB UAC (phone)
-After=snapserver.service snapfifo-create.service
-
-[Service]
-Type=simple
-User=root
-ExecStart=${BRIDGE_DIR}/uac_source.sh
-Restart=on-failure
-RestartSec=3
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-# ── snapcast-sourcemic (mic ALSA → FIFO) ──
-cat > "$BRIDGE_DIR/mic_source.sh" << 'EOF'
-#!/bin/bash
-# Mic source: finds the first non-monitor, non-UAC ALSA capture device.
-FIFO="/tmp/snapfifo"
-RATE=96000
-CHANNELS=2
-FORMAT=S32_LE
-
-for i in $(seq 1 20); do
-    DEVICE=$(arecord -l 2>/dev/null | awk '/card/{print $2}' | head -1 | tr -d ':')
-    [ -n "$DEVICE" ] && break
-    sleep 1
-done
-
-if [ -z "$DEVICE" ]; then
-    echo "Mic ALSA device not found" >&2
-    exit 1
-fi
-
-echo "Mic source: using device hw:${DEVICE},0"
-exec arecord -D "hw:${DEVICE},0" -f "$FORMAT" -r "$RATE" -c "$CHANNELS" -t raw > "$FIFO"
-EOF
-chmod +x "$BRIDGE_DIR/mic_source.sh"
-
-cat > /etc/systemd/system/snapcast-sourcemic.service << EOF
-[Unit]
-Description=Snapcast source — Microphone
-After=snapserver.service snapfifo-create.service
-
-[Service]
-Type=simple
-User=root
-ExecStart=${BRIDGE_DIR}/mic_source.sh
-Restart=on-failure
-RestartSec=3
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-# ── snapcast-sourcebt (PulseAudio BT null-sink → FIFO) ──
-cat > "$BRIDGE_DIR/bt_source.sh" << 'EOF'
-#!/bin/bash
-# BT source: PulseAudio reads from the bt_snapcast_sink null-sink monitor.
-# The bridge loads a module-loopback from the BT A2DP source to this sink
-# when a BT device connects, so parec always has a stable device to read from.
-FIFO="/tmp/snapfifo"
-
-# Wait for PulseAudio to be ready and the null sink to exist
-for i in $(seq 1 30); do
-    if pactl list sinks short 2>/dev/null | grep -q "bt_snapcast_sink"; then
-        break
-    fi
-    sleep 1
-done
-
-if ! pactl list sinks short 2>/dev/null | grep -q "bt_snapcast_sink"; then
-    echo "bt_snapcast_sink not found in PulseAudio — is PA running?" >&2
-    exit 1
-fi
-
-echo "BT source: reading from bt_snapcast_sink.monitor → $FIFO"
-exec parec \
-    --device=bt_snapcast_sink.monitor \
-    --format=s32le \
-    --rate=96000 \
-    --channels=2 \
-    --latency-msec=50 > "$FIFO"
-EOF
-chmod +x "$BRIDGE_DIR/bt_source.sh"
-
-cat > /etc/systemd/system/snapcast-sourcebt.service << EOF
-[Unit]
-Description=Snapcast source — Bluetooth A2DP (via PulseAudio)
-After=snapserver.service snapfifo-create.service pulseaudio.service bt-agent.service
-
+Description=PipeWire UAC audio source to Snapcast FIFO
+After=pipewire.service snapserver.service
+Wants=pipewire.service
+ 
 [Service]
 Type=simple
 User=$REAL_USER
-Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/${USER_ID}/bus
-Environment=XDG_RUNTIME_DIR=/run/user/${USER_ID}
-ExecStart=${BRIDGE_DIR}/bt_source.sh
-Restart=on-failure
-RestartSec=3
-
+Environment=XDG_RUNTIME_DIR=/run/user/$USER_ID
+ExecStartPre=/bin/bash -c 'test -p /tmp/snapfifo || mkfifo /tmp/snapfifo'
+ExecStart=/bin/bash -c '\\
+    while true; do \\
+        DEVICE=\$(pactl list sources short | grep "alsa_input.platform-.*usb" | awk "{print \\\$2}" | head -1); \\
+        if [ -n "\$DEVICE" ]; then \\
+            parec \\
+                --device=\$DEVICE \\
+                --format=s32le \\
+                --rate=96000 \\
+                --channels=2 \\
+                --latency-msec=10 \\
+                --process-time-msec=5 \\
+            > /tmp/snapfifo || true; \\
+        else \\
+            sleep 1; \\
+        fi; \\
+    done'
+Restart=always
+RestartSec=2
+ 
 [Install]
 WantedBy=multi-user.target
-EOF
+SVCEOF
+ 
+# ── snapcast-sourcemic (mic → FIFO) — original unchanged ──
+cat > /etc/systemd/system/snapcast-sourcemic.service << SVCEOF
+[Unit]
+Description=PipeWire mic audio source to Snapcast FIFO
+After=pipewire.service snapserver.service
+Wants=pipewire.service
+ 
+[Service]
+Type=simple
+User=$REAL_USER
+Environment=XDG_RUNTIME_DIR=/run/user/$USER_ID
+ExecStartPre=/bin/bash -c 'test -p /tmp/snapfifo || mkfifo /tmp/snapfifo'
+ExecStart=/bin/bash -c '\\
+    while true; do \\
+        DEVICE=\$(pactl list sources short | grep alsa_input | grep -v monitor | grep -v "platform-" | awk "{print \\\$2}" | head -1); \\
+        if [ -n "\$DEVICE" ]; then \\
+            parec \\
+                --device=\$DEVICE \\
+                --format=s32le \\
+                --rate=96000 \\
+                --channels=2 \\
+                --latency-msec=10 \\
+                --process-time-msec=5 \\
+            > /tmp/snapfifo || true; \\
+        else \\
+            sleep 1; \\
+        fi; \\
+    done'
+Restart=always
+RestartSec=2
+ 
+[Install]
+WantedBy=multi-user.target
+SVCEOF
+ 
+# ── snapcast-sourcebt (BT → FIFO) — new addition ──
+# Same pattern as above. Bridge loads PA loopback from BT A2DP source
+# to bt_snapcast_sink when phone connects; parec reads from that sink monitor.
+cat > /etc/systemd/system/snapcast-sourcebt.service << SVCEOF
+[Unit]
+Description=PulseAudio BT audio source to Snapcast FIFO
+After=pulseaudio.service snapserver.service bt-agent.service
+Wants=pulseaudio.service
+ 
+[Service]
+Type=simple
+User=$REAL_USER
+Environment=XDG_RUNTIME_DIR=/run/user/$USER_ID
+ExecStartPre=/bin/bash -c 'test -p /tmp/snapfifo || mkfifo /tmp/snapfifo'
+ExecStart=/bin/bash -c '\\
+    while true; do \\
+        if pactl list sinks short 2>/dev/null | grep -q "bt_snapcast_sink"; then \\
+            parec \\
+                --device=bt_snapcast_sink.monitor \\
+                --format=s32le \\
+                --rate=96000 \\
+                --channels=2 \\
+                --latency-msec=10 \\
+                --process-time-msec=5 \\
+            > /tmp/snapfifo || true; \\
+        else \\
+            sleep 1; \\
+        fi; \\
+    done'
+Restart=always
+RestartSec=2
+ 
+[Install]
+WantedBy=multi-user.target
+SVCEOF
 
-# All three source services are disabled at boot — bridge starts/stops them
-systemctl daemon-reload
-systemctl disable snapcast-source.service    2>/dev/null || true
-systemctl disable snapcast-sourcemic.service 2>/dev/null || true
-systemctl disable snapcast-sourcebt.service  2>/dev/null || true
+# Both disabled at boot — server_bridge starts them based on input mode
+systemctl disable snapcast-source    2>/dev/null || true
+systemctl disable snapcast-sourcemic 2>/dev/null || true
+systemctl disable snapcast-sourcebt  2>/dev/null || true
 
 # ── 8. PulseAudio — user mode, 96kHz/32-bit ───────────────────────────────
 echo ""
@@ -685,7 +651,7 @@ echo "========================================="
 echo " Setup complete!"
 echo ""
 echo " Services:"
-echo "   snapfifo-create  — creates /tmp/snapfifo at boot"
+echo "   snapserver       — Snapcast server (creates and reads /tmp/snapfifo)"
 echo "   snapserver       — Snapcast server (reads FIFO)"
 echo "   bt-init          — USB BT dongle init"
 echo "   bt-agent         — auto-pair agent (started by bridge in BT mode)"
