@@ -30,7 +30,7 @@ MSG_MODE_SYNC       = 0x05
 MSG_MODE_BT         = 0x06
 MSG_POWER_SET       = 0x07
 MSG_RESTART_SERVER  = 0x09
-MSG_INPUT_SET       = 0x0A   # 0=usb, 1=mic
+MSG_INPUT_SET       = 0x0A   # 0=usb, 1=mic, 2=bt
 MSG_MIC_GAIN_SET    = 0x0B
 MSG_ACK             = 0x10
 MSG_CLIENT_LIST     = 0x11
@@ -39,14 +39,19 @@ MSG_PONG            = 0x13
 MSG_STATE_UPDATE    = 0x20
 MSG_MODE_SWITCHING  = 0x21
 MSG_POWER_STATE     = 0x22
-MSG_POWER_PENDING   = 0x23 
+MSG_POWER_PENDING   = 0x23
 MSG_MIC_STATUS      = 0x24
+MSG_BT_STATUS       = 0x26   # present(1) — ESP side handled later
 MSG_PW_SET          = 0x30
-MSG_RENAME          = 0x33  # add at top with other constants
+MSG_RENAME          = 0x33
 MSG_PW_ACK          = 0x34
 
 MODE_SYNC = 0
 MODE_BT   = 1
+
+INPUT_USB = 0
+INPUT_MIC = 1
+INPUT_BT  = 2
 
 CLIENT_ID_LEN     = 36
 CLIENT_NAME_LEN   = 32
@@ -83,6 +88,7 @@ def build_frame(msg_type: int, payload: bytes = b"") -> bytes:
     crc_data = bytes([msg_type, plen & 0xFF, (plen >> 8) & 0xFF]) + payload
     return header + payload + bytes([crc8(crc_data)])
 
+
 def _find_mic_source() -> Optional[str]:
     """Same selection rule as snapcast-sourcemic.service's DEVICE lookup."""
     try:
@@ -100,7 +106,7 @@ def _find_mic_source() -> Optional[str]:
     return None
 
 
-def _get_mic_gain(source: str) -> Optional[int]:
+def _get_source_gain(source: str) -> Optional[int]:
     try:
         result = subprocess.run(["pactl", "get-source-volume", source],
                                 capture_output=True, text=True, timeout=3)
@@ -108,8 +114,67 @@ def _get_mic_gain(source: str) -> Optional[int]:
         if m:
             return int(m.group(1))
     except Exception as e:
-        log.warning("_get_mic_gain error: %s", e)
+        log.warning("_get_source_gain error: %s", e)
     return None
+
+
+def _find_bt_source() -> Optional[str]:
+    """Find the active A2DP Bluetooth source in PulseAudio."""
+    try:
+        result = subprocess.run(["pactl", "list", "sources", "short"],
+                                capture_output=True, text=True, timeout=5)
+        for line in result.stdout.splitlines():
+            parts = line.split()
+            if len(parts) < 2:
+                continue
+            name = parts[1]
+            if "bluez_source" in name and "monitor" not in name:
+                return name
+    except Exception as e:
+        log.warning("_find_bt_source error: %s", e)
+    return None
+
+
+def _bt_get_connected_device() -> str:
+    """Return name of connected BT device, or empty string."""
+    try:
+        result = subprocess.run(["bluetoothctl", "info"],
+                                capture_output=True, text=True, timeout=5)
+        if "Connected: yes" in result.stdout:
+            for line in result.stdout.splitlines():
+                if "Name:" in line:
+                    return line.split("Name:", 1)[1].strip()
+            return "BT Device"
+    except Exception:
+        pass
+    return ""
+
+
+def pulseaudio_start(user: str, uid: int):
+    try:
+        env = {**os.environ,
+               "DBUS_SESSION_BUS_ADDRESS": f"unix:path=/run/user/{uid}/bus",
+               "XDG_RUNTIME_DIR": f"/run/user/{uid}"}
+        subprocess.run(["sudo", "-u", user, "systemctl", "--user",
+                        "start", "pulseaudio.service"],
+                       timeout=10, capture_output=True, env=env)
+        log.info("PulseAudio started")
+    except Exception as e:
+        log.error("pulseaudio start: %s", e)
+
+
+def pulseaudio_stop(user: str, uid: int):
+    try:
+        env = {**os.environ,
+               "DBUS_SESSION_BUS_ADDRESS": f"unix:path=/run/user/{uid}/bus",
+               "XDG_RUNTIME_DIR": f"/run/user/{uid}"}
+        subprocess.run(["sudo", "-u", user, "systemctl", "--user",
+                        "stop", "pulseaudio.service", "pulseaudio.socket"],
+                       timeout=10, capture_output=True, env=env)
+        log.info("PulseAudio stopped")
+    except Exception as e:
+        log.error("pulseaudio stop: %s", e)
+
 
 class HashPullServer(threading.Thread):
     def __init__(self, get_hash_fn):
@@ -291,8 +356,8 @@ class ClientRecord:
         self.snap_connected = False
         self.mode           = MODE_SYNC
         self.powered        = False
-        self.power_pending  = False 
-        self.power_target   = False  
+        self.power_pending  = False
+        self.power_target   = False
         self.bt_connected   = False
         self.bt_dev_name    = ""
         self.client_ip      = ""
@@ -302,7 +367,7 @@ class ClientRecord:
         self._last_pong = time.time()
         self._ping_misses = 0
 
-        self.pending_power: Optional[bool] = None   # queued power command waiting for reconnect
+        self.pending_power: Optional[bool] = None
 
     def set_sock(self, sock: socket.socket, addr):
         with self._sock_lock:
@@ -324,7 +389,6 @@ class ClientRecord:
         try:
             sock.sendall((json.dumps(msg) + "\n").encode())
         except BlockingIOError:
-            # send buffer momentarily full — transient, don't tear down a healthy socket
             log.warning("ctrl_send to %s: send buffer busy, skipping this cycle", self.name)
         except Exception as e:
             log.warning("ctrl_send to %s failed: %s", self.name, e)
@@ -341,8 +405,6 @@ class ClientRecord:
                 self._sock = None
 
     def disconnect_if(self, sock) -> bool:
-        """Only closes/clears if `sock` is still this record's active socket.
-        Returns True if it actually cleaned up (i.e. this was the live session)."""
         with self._sock_lock:
             if self._sock is sock:
                 try:
@@ -352,7 +414,7 @@ class ClientRecord:
                 self._sock = None
                 return True
             return False
-        
+
     def connected(self) -> bool:
         with self._sock_lock:
             return self._sock is not None
@@ -403,44 +465,53 @@ class ServerBridge:
     ESP_TIMEOUT_S          = 20
     SNAP_HEALTH_INTERVAL_S = 10
     MIC_CHECK_INTERVAL_S   = 2
+    BT_CHECK_INTERVAL_S    = 2
     CLIENT_LIST_RESEND_S   = 5
 
-    def __init__(self, serial_port, baud, snap_host, snap_port):
+    def __init__(self, serial_port, baud, snap_host, snap_port, pa_user="", pa_uid=0):
         self.ser  = serial.Serial(serial_port, baud, timeout=0.05)
         self.snap = SnapcastClient(snap_host, snap_port)
         self.rx   = UARTReceiver()
 
+        # PulseAudio user context (needed for BT mode's systemctl --user calls)
+        self._pa_user = pa_user
+        self._pa_uid  = pa_uid
+
         self._clients: dict[str, ClientRecord] = {}
         self._clients_lock = threading.Lock()
 
-        self._esp_connected        = False
-        self._last_esp_msg_time    = time.time()
-        self._last_snap_health     = time.time()
+        self._esp_connected         = False
+        self._last_esp_msg_time     = time.time()
+        self._last_snap_health      = time.time()
         self._last_client_list_send = 0.0
-        self._esp_vol_set_time     = {}
-        self._running              = True
-        self._input_mode           = 0  # 0=usb 1=mic; default usb, both services start disabled
-        self._mic_present          = False   # ← add
-        self._mic_gain              = 50     # ← add
-        self._last_mic_check        = 0.0    # ← add
+        self._esp_vol_set_time      = {}
+        self._running               = True
+
+        # Input mode — 0=usb, 1=mic, 2=bt
+        self._input_mode    = INPUT_USB
+        self._input_mode_lock = threading.Lock()
+
+        # Mic state
+        self._mic_present   = False
+        self._mic_gain      = 50
+        self._last_mic_check = 0.0
+
+        # BT state
+        self._bt_present       = False
+        self._bt_dev_name      = ""
+        self._bt_loopback_id: Optional[int] = None
+        self._last_bt_check    = 0.0
 
         self._pw_hash, self._pw_user_set = load_or_init_password()
         self._hash_pull_server = HashPullServer(lambda: self._pw_hash)
         self._hash_pull_server.start()
 
-    # ── Client lookup — by snap_id first, then name fallback ──────────────
+    # ── Client lookup ──────────────────────────────────────────────────────
     def _find_client(self, snap_id: str) -> Optional[ClientRecord]:
-        """
-        Look up a client by snap_id. Falls back to name match so commands
-        from the ESP still work during the window before Snapcast resolves
-        the real snap_id (MAC address).
-        """
         with self._clients_lock:
             rec = self._clients.get(snap_id)
             if rec:
                 return rec
-            # Fallback: match by name (snap_id sent by ESP may still be the
-            # hostname placeholder used before Snapcast resolution)
             name_lower = snap_id.lower()
             for r in self._clients.values():
                 if r.name.lower() == name_lower:
@@ -503,16 +574,14 @@ class ServerBridge:
         name    = msg.get("name", addr[0])
 
         if not snap_id:
-            snap_id = name  # placeholder until Snapcast resolves real snap_id
+            snap_id = name
 
         with self._clients_lock:
             rec = self._clients.get(snap_id)
             if rec is None:
-                # Also check by name in case it was registered under a different key
                 for r in self._clients.values():
                     if r.name.lower() == name.lower():
                         rec = r
-                        # Re-key under new snap_id if different
                         if rec.snap_id != snap_id:
                             old_id = rec.snap_id
                             self._clients.pop(old_id, None)
@@ -578,7 +647,7 @@ class ServerBridge:
             if was_active:
                 self._on_client_gone(rec)
             else:
-                log.info("Stale session for %s closed (already superseded by a newer connection)", rec.name)
+                log.info("Stale session for %s closed", rec.name)
 
     def _send_single_state(self, rec: ClientRecord):
         time.sleep(0.3)
@@ -702,7 +771,6 @@ class ServerBridge:
 
                     rec = self._clients.get(snap_id)
                     if rec is None:
-                        # try match by name for placeholder-registered clients
                         for r in self._clients.values():
                             if r.name.lower() == name.lower() and r.snap_id == r.name:
                                 old_id = r.snap_id
@@ -726,7 +794,7 @@ class ServerBridge:
                     if rec.mode == MODE_SYNC and just_connected:
                         rec.volume = volume
         return changed
-    
+
     # ── Control message handler ───────────────────────────────────────────
     def _on_ctrl_message(self, rec: ClientRecord, msg: dict):
         mtype = msg.get("type", "")
@@ -750,14 +818,14 @@ class ServerBridge:
             rec.bt_connected   = msg.get("bt_connected",   rec.bt_connected)
             rec.bt_dev_name    = msg.get("bt_dev_name",    "")
             rec.powered        = msg.get("powered",        rec.powered)
-            
+
             new_name = msg.get("client_name", "")
             if new_name:
                 old_name = rec.name
                 rec.name = new_name
                 if old_name != new_name and self._esp_connected:
-                    self._send_client_list()   # ← name changed, push new list
-                    return                     # _send_client_list already calls _resend_all_states
+                    self._send_client_list()
+                    return
 
             if self._esp_connected:
                 payload = self._id_bytes(rec.snap_id) + bytes([
@@ -769,7 +837,7 @@ class ServerBridge:
                 self.send_frame(MSG_STATE_UPDATE, payload)
                 self.send_frame(MSG_POWER_STATE,
                                 self._id_bytes(rec.snap_id) + bytes([1 if rec.powered else 0]))
-                
+
         elif mtype == "switching":
             if self._esp_connected:
                 self.send_frame(MSG_MODE_SWITCHING, self._id_bytes(rec.snap_id))
@@ -777,15 +845,15 @@ class ServerBridge:
         elif mtype == "power_state":
             powered = msg.get("powered", rec.powered)
             rec.powered = powered
-            if rec.power_pending and powered == rec.power_target:   #
-                rec.power_pending = False    
+            if rec.power_pending and powered == rec.power_target:
+                rec.power_pending = False
             if self._esp_connected:
                 self.send_frame(MSG_POWER_STATE,
                                 self._id_bytes(rec.snap_id) + bytes([1 if powered else 0]))
-        
-        elif mtype == "power_pending":                 
+
+        elif mtype == "power_pending":
             target = msg.get("target", rec.powered)
-            rec.power_pending = True  
+            rec.power_pending = True
             rec.power_target  = target
             if self._esp_connected:
                 self.send_frame(MSG_POWER_PENDING,
@@ -807,7 +875,6 @@ class ServerBridge:
                 log.error("Snap status on INIT failed: %s", e)
             self._send_client_list()
             self.send_frame(MSG_PW_ACK, bytes([1 if self._pw_user_set else 0]))
-            # On ESP connect, start whichever input was last active
             threading.Thread(
                 target=self._apply_input_mode,
                 args=(self._input_mode,),
@@ -844,7 +911,8 @@ class ServerBridge:
             rec = self._find_client(snap_id)
             if rec and rec.connected():
                 rec.ctrl_send({"type": "set_mode", "mode": new_mode})
-                log.info("Mode switch -> %s sent to %s", "SYNC" if new_mode == MODE_SYNC else "BT", rec.name)
+                log.info("Mode switch -> %s sent to %s",
+                         "SYNC" if new_mode == MODE_SYNC else "BT", rec.name)
             else:
                 log.warning("No control connection to %s", snap_id)
 
@@ -861,7 +929,7 @@ class ServerBridge:
                     log.info("Power -> %s sent to %s", powered, rec.name)
                 else:
                     rec.pending_power = powered
-                    log.warning("No control connection to %s — queued power=%s for delivery on reconnect",
+                    log.warning("No control connection to %s — queued power=%s",
                                 snap_id, powered)
             else:
                 log.warning("Unknown client %s for power command", snap_id)
@@ -869,16 +937,19 @@ class ServerBridge:
         elif msg_type == MSG_INPUT_SET:
             if len(payload) < 1:
                 return
-            mode = payload[0]  # 0=usb, 1=mic
+            mode = payload[0]   # 0=usb, 1=mic, 2=bt
             self._input_mode = mode
-            log.info("Input mode set: %s", "mic" if mode else "usb")
+            log.info("Input mode set: %s", {0:"usb",1:"mic",2:"bt"}.get(mode, str(mode)))
             threading.Thread(
                 target=self._apply_input_mode,
                 args=(mode,),
                 daemon=True,
             ).start()
-            if mode == 1:
-                threading.Thread(target=self._poll_mic_status, args=(True,), daemon=True).start()  # ← add
+            # Immediately poll the new source so ESP gets a status update quickly
+            if mode == INPUT_MIC:
+                threading.Thread(target=self._poll_mic_status, args=(True,), daemon=True).start()
+            elif mode == INPUT_BT:
+                threading.Thread(target=self._poll_bt_status, args=(True,), daemon=True).start()
 
         elif msg_type == MSG_RESTART_SERVER:
             log.info("ESP requested snapserver restart")
@@ -910,7 +981,7 @@ class ServerBridge:
                         args=(rec.client_ip, new_hash),
                         daemon=True,
                     ).start()
-        
+
         elif msg_type == MSG_RENAME:
             if len(payload) < CLIENT_ID_LEN + 1:
                 return
@@ -926,7 +997,7 @@ class ServerBridge:
                 if rec.connected():
                     rec.ctrl_send({"type": "set_name", "name": new_name})
                 self._send_client_list()
-        
+
         elif msg_type == MSG_MIC_GAIN_SET:
             if len(payload) < 1:
                 return
@@ -935,7 +1006,7 @@ class ServerBridge:
             if source:
                 try:
                     subprocess.run(["pactl", "set-source-volume", source, f"{gain}%"],
-                                timeout=3, capture_output=True)
+                                   timeout=3, capture_output=True)
                     self._mic_gain = gain
                     log.info("Mic gain set via ESP: %d%%", gain)
                 except Exception as e:
@@ -980,33 +1051,117 @@ class ServerBridge:
             except Exception as e:
                 log.error("Snap refresh failed: %s", e)
 
-    # ── Input mode switch ────────────────────────────────────────────────
+    # ── Input mode switch ─────────────────────────────────────────────────
     def _apply_input_mode(self, mode: int):
-        """Switch audio input source."""
+        """
+        Switch the snapserver FIFO source. Serialized by _input_mode_lock so
+        rapid mode changes or concurrent ESP reconnects don't race.
+
+        BT services (PulseAudio, bt-agent) are started once when BT mode is
+        first selected and left running permanently — they don't interfere with
+        USB/mic pipelines which write directly to the FIFO via ALSA, bypassing
+        PulseAudio entirely. Only the active source service changes.
+        """
+        if not self._input_mode_lock.acquire(blocking=False):
+            log.warning("Input mode switch already in progress — skipping duplicate call")
+            return
         try:
-            if mode == 0:
+            if mode == INPUT_USB:
                 log.info("Switching input to USB/UAC")
-                subprocess.run(["sudo", "systemctl", "stop",  "snapcast-sourcemic"],
+                subprocess.run(["sudo", "systemctl", "stop", "snapcast-sourcemic"],
+                               timeout=10, check=False, capture_output=True)
+                subprocess.run(["sudo", "systemctl", "stop", "snapcast-sourcebt"],
                                timeout=10, check=False, capture_output=True)
                 subprocess.run(["sudo", "systemctl", "start", "snapcast-source"],
                                timeout=10, check=False, capture_output=True)
                 log.info("Input: USB/UAC active")
-            else:
+
+            elif mode == INPUT_MIC:
                 log.info("Switching input to mic")
-                subprocess.run(["sudo", "systemctl", "stop",  "snapcast-source"],
+                subprocess.run(["sudo", "systemctl", "stop", "snapcast-source"],
+                               timeout=10, check=False, capture_output=True)
+                subprocess.run(["sudo", "systemctl", "stop", "snapcast-sourcebt"],
                                timeout=10, check=False, capture_output=True)
                 subprocess.run(["sudo", "systemctl", "start", "snapcast-sourcemic"],
                                timeout=10, check=False, capture_output=True)
                 log.info("Input: mic active")
+
+            elif mode == INPUT_BT:
+                log.info("Switching input to Bluetooth")
+                subprocess.run(["sudo", "systemctl", "stop", "snapcast-source"],
+                               timeout=10, check=False, capture_output=True)
+                subprocess.run(["sudo", "systemctl", "stop", "snapcast-sourcemic"],
+                               timeout=10, check=False, capture_output=True)
+                # Start PA + bt-agent only if not already running
+                self._ensure_bt_services()
+                subprocess.run(["sudo", "systemctl", "start", "snapcast-sourcebt"],
+                               timeout=10, check=False, capture_output=True)
+                log.info("Input: Bluetooth active")
+
+            else:
+                log.warning("Unknown input mode: %d", mode)
+
         except Exception as e:
             log.error("Input mode switch failed: %s", e)
-    
+        finally:
+            self._input_mode_lock.release()
+
+    # ── BT service control ────────────────────────────────────────────────
+    def _ensure_bt_services(self):
+        """Start PulseAudio and bt-agent if not already running. Idempotent."""
+        if self._pa_user:
+            pulseaudio_start(self._pa_user, self._pa_uid)
+            time.sleep(2)
+        try:
+            subprocess.run(["sudo", "systemctl", "start", "bt-agent"],
+                           timeout=10, check=False, capture_output=True)
+            log.info("bt-agent started")
+        except Exception as e:
+            log.error("bt-agent start failed: %s", e)
+
+    # ── BT loopback management ────────────────────────────────────────────
+    def _load_bt_loopback(self, source: str):
+        """Route BT A2DP source → bt_snapcast_sink via PA loopback module."""
+        # Unload any previous loopback first (source might have changed)
+        self._unload_bt_loopback()
+        try:
+            result = subprocess.run(
+                ["pactl", "load-module", "module-loopback",
+                 f"source={source}",
+                 "sink=bt_snapcast_sink",
+                 "latency_msec=200"],
+                capture_output=True, text=True, timeout=5
+            )
+            module_id_str = result.stdout.strip()
+            if module_id_str.isdigit():
+                self._bt_loopback_id = int(module_id_str)
+                log.info("BT loopback loaded: module %d (%s → bt_snapcast_sink)",
+                         self._bt_loopback_id, source)
+            else:
+                log.error("Unexpected pactl output when loading loopback: %r", module_id_str)
+        except Exception as e:
+            log.error("Load BT loopback failed: %s", e)
+
+    def _unload_bt_loopback(self):
+        """Unload PA loopback module if active."""
+        if self._bt_loopback_id is None:
+            return
+        try:
+            subprocess.run(["pactl", "unload-module", str(self._bt_loopback_id)],
+                           capture_output=True, timeout=5)
+            log.info("BT loopback unloaded: module %d", self._bt_loopback_id)
+        except Exception as e:
+            log.warning("Unload BT loopback failed: %s", e)
+        finally:
+            self._bt_loopback_id = None
+
+    # ── Mic status ────────────────────────────────────────────────────────
     def _poll_mic_status(self, force: bool = False):
         source  = _find_mic_source()
         present = source is not None
         gain    = self._mic_gain
         if present:
-            g = _get_mic_gain(source)
+            g = _get_source_gain(source)
             if g is not None:
                 gain = g
         changed = (present != self._mic_present) or (gain != self._mic_gain)
@@ -1018,6 +1173,37 @@ class ServerBridge:
     def _send_mic_status(self):
         self.send_frame(MSG_MIC_STATUS,
                         bytes([1 if self._mic_present else 0, self._mic_gain & 0xFF]))
+
+    # ── BT status ─────────────────────────────────────────────────────────
+    def _poll_bt_status(self, force: bool = False):
+        """
+        Check whether a BT A2DP source is active in PulseAudio.
+        When the source appears, wire it into the bt_snapcast_sink via loopback.
+        When it disappears, unload the loopback.
+        Sends MSG_BT_STATUS to ESP on change (ESP side handled later).
+        """
+        source  = _find_bt_source()
+        present = source is not None
+
+        if present != self._bt_present:
+            self._bt_present = present
+            if present:
+                self._load_bt_loopback(source)
+                self._bt_dev_name = _bt_get_connected_device()
+                log.info("BT source appeared: %s (device: %s)", source, self._bt_dev_name)
+            else:
+                self._unload_bt_loopback()
+                self._bt_dev_name = ""
+                log.info("BT source removed")
+            if self._esp_connected:
+                self._send_bt_status()
+        elif force and self._esp_connected:
+            self._send_bt_status()
+
+    def _send_bt_status(self):
+        # ESP side will handle MSG_BT_STATUS once the ESP code is updated.
+        # Until then, the ESP will log it as an unknown message — harmless.
+        self.send_frame(MSG_BT_STATUS, bytes([1 if self._bt_present else 0]))
 
     # ── Restart Snapserver ────────────────────────────────────────────────
     def _restart_snapserver(self):
@@ -1108,12 +1294,22 @@ class ServerBridge:
                 except Exception as e:
                     log.error("Snap notification error: %s", e)
 
+            # Mic status polling (only in mic mode)
             if self._esp_connected:
                 now_mic = time.time()
-                if self._input_mode == 1 and now_mic - self._last_mic_check >= self.MIC_CHECK_INTERVAL_S:
+                if self._input_mode == INPUT_MIC and \
+                        now_mic - self._last_mic_check >= self.MIC_CHECK_INTERVAL_S:
                     self._last_mic_check = now_mic
                     self._poll_mic_status()
-            
+
+            # BT status polling (only in BT mode)
+            if self._esp_connected:
+                now_bt = time.time()
+                if self._input_mode == INPUT_BT and \
+                        now_bt - self._last_bt_check >= self.BT_CHECK_INTERVAL_S:
+                    self._last_bt_check = now_bt
+                    self._poll_bt_status()
+
             if self._esp_connected:
                 now_list = time.time()
                 if now_list - self._last_client_list_send >= self.CLIENT_LIST_RESEND_S:
@@ -1126,9 +1322,14 @@ def main():
     parser.add_argument("--baud",      type=int, default=460800)
     parser.add_argument("--snap-host", default="127.0.0.1")
     parser.add_argument("--snap-port", type=int, default=1705)
+    parser.add_argument("--pa-user",   default="",
+                        help="Username whose PulseAudio session to use for BT mode")
+    parser.add_argument("--pa-uid",    type=int, default=0,
+                        help="UID matching --pa-user for systemctl --user calls")
     args = parser.parse_args()
 
-    bridge = ServerBridge(args.port, args.baud, args.snap_host, args.snap_port)
+    bridge = ServerBridge(args.port, args.baud, args.snap_host, args.snap_port,
+                          pa_user=args.pa_user, pa_uid=args.pa_uid)
     try:
         bridge.run()
     except KeyboardInterrupt:
