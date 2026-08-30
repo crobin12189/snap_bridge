@@ -3,123 +3,129 @@ set -e
 
 # ── Must run as root ──
 if [ "$EUID" -ne 0 ]; then
-    echo "Run with sudo: sudo ./server_setup.sh"
+    echo "Run with sudo: sudo ./setup.sh"
     exit 1
 fi
 
+# ── Detect the real user (not root) ──
 REAL_USER="${SUDO_USER:-$(logname)}"
 REAL_HOME=$(eval echo "~$REAL_USER")
 USER_ID=$(id -u "$REAL_USER")
 
 echo "========================================="
-echo " Snapcast SERVER + ESP32 Bridge Setup"
-echo " User: $REAL_USER (uid=$USER_ID)"
+echo " Snapcast Server Setup"
+echo " User: $REAL_USER"
 echo " Home: $REAL_HOME"
 echo "========================================="
 
+# ── Prompt for static IP settings ──
 echo ""
 echo "--- Static IP Configuration for eth0 ---"
-read -rp "Static IP address (e.g. 192.168.1.50): "  STATIC_IP
-read -rp "Subnet prefix length (e.g. 24):           " SUBNET
-read -rp "Gateway (e.g. 192.168.1.1):               " GATEWAY
-read -rp "DNS server (e.g. 192.168.1.1 or 8.8.8.8):" DNS
-read -rp "Disable WiFi? [y/N]: "                      DISABLE_WIFI
+read -rp "Static IP address (e.g. 192.168.1.100): " STATIC_IP
+read -rp "Subnet prefix length (e.g. 24 for /24): " SUBNET
+read -rp "Gateway (e.g. 192.168.1.1): " GATEWAY
+read -rp "DNS server (e.g. 192.168.1.1 or 8.8.8.8): " DNS
+read -rp "Disable WiFi? [y/N]: " DISABLE_WIFI
 echo ""
 echo "  IP:      $STATIC_IP/$SUBNET"
 echo "  Gateway: $GATEWAY"
 echo "  DNS:     $DNS"
+if [[ "$DISABLE_WIFI" =~ ^[Yy]$ ]]; then
+    echo "  WiFi:    disabled"
+else
+    echo "  WiFi:    enabled"
+fi
 echo ""
 read -rp "Confirm? [y/N]: " CONFIRM
-[[ "$CONFIRM" =~ ^[Yy]$ ]] || { echo "Aborted."; exit 1; }
+if [[ ! "$CONFIRM" =~ ^[Yy]$ ]]; then
+    echo "Aborted."
+    exit 1
+fi
 
-# ── 1. Update ─────────────────────────────────────────────────────────────
+# ── 1. Update package lists only (no upgrade) ──
 echo ""
-echo "[1/14] Updating package lists..."
+echo "[1/9] Updating package lists..."
 apt update
 
-# ── 2. Install packages ───────────────────────────────────────────────────
+# ── 2. Install dependencies (pinned versions) ──
 echo ""
-echo "[2/14] Installing packages..."
+echo "[2/9] Installing packages..."
 apt install -y \
-    snapserver \
-    pulseaudio \
-    pulseaudio-module-bluetooth \
-    pulseaudio-utils \
-    python3-serial \
-    python3-dbus \
-    python3-gi \
-    avahi-daemon \
-    git \
+    snapserver=0.26.0* \
+    pipewire=1.2.7* pipewire-pulse=1.2.7* wireplumber \
+    pulseaudio-utils=16.1+dfsg1-2+rpt1.1 \
+    alsa-utils \
     gpiod \
-    python3-dev \
-    ffmpeg
+    python3 python3-pip python3-venv python3-serial \
+    python3-dbus python3-gi
 
-apt-mark hold pulseaudio pulseaudio-module-bluetooth pulseaudio-utils snapserver
+# Prevent snapserver and pipewire from being auto-upgraded
+apt-mark hold snapserver pipewire pipewire-pulse
 
-usermod -a -G bluetooth "$REAL_USER"
-usermod -a -G dialout   "$REAL_USER"
-usermod -a -G pulse     "$REAL_USER"
-usermod -a -G pulse-access "$REAL_USER"
-usermod -a -G gpio      "$REAL_USER"
-
-# ── 3. config.txt ─────────────────────────────────────────────────────────
+# ── 3. Configure boot config and kernel modules ──
 echo ""
-echo "[3/14] Configuring /boot/firmware/config.txt..."
+echo "[3/9] Configuring boot config and USB gadget audio..."
 
-CONFIG="/boot/firmware/config.txt"
-cp "$CONFIG" "${CONFIG}.bak"
+CONFIG=/boot/firmware/config.txt
 
-sed -i 's/^#dtparam=i2c_arm=on/dtparam=i2c_arm=on/'   "$CONFIG"
-sed -i 's/^#dtparam=i2s=on/dtparam=i2s=on/'           "$CONFIG"
-sed -i 's/^#dtparam=spi=on/dtparam=spi=on/'           "$CONFIG"
-sed -i 's/^dtparam=audio=on/#dtparam=audio=on/'        "$CONFIG"
+# Enable SPI for W5500
+sed -i 's/^#dtparam=spi=on/dtparam=spi=on/' "$CONFIG"
+
+# Download and install W5500 overlay
+wget -O /tmp/w5500-overlay.dts \
+    "https://raw.githubusercontent.com/crobin12189/snap_bridge/main/w5500-overlay.dts"
+dtc -I dts -O dtb -o /boot/overlays/w5500-driver.dtbo /tmp/w5500-overlay.dts
+rm /tmp/w5500-overlay.dts
+
+# Disable vc4-kms-v3d (comment it out if uncommented)
 sed -i 's/^dtoverlay=vc4-kms-v3d/#dtoverlay=vc4-kms-v3d/' "$CONFIG"
 
-# Remove existing [all] section and rewrite cleanly
+# Remove any existing [all] section and everything after it, we'll rewrite it
+# This avoids conflicts with dwc2 in other sections like [cm5]
 if grep -q "^\[all\]" "$CONFIG"; then
     sed -i '/^\[all\]/,$d' "$CONFIG"
 fi
 
+# Append clean [all] section
+# NOTE: miniuart-bt keeps onboard BT enabled (needed for BT input mode)
 cat >> "$CONFIG" << 'CFGEOF'
 [all]
-# UART for ESP32 communication
-enable_uart=1
-
-# USB-C UAC gadget mode (phone → Pi as USB audio device)
 dtoverlay=dwc2,dr_mode=peripheral
-
-# Bluetooth — keep onboard BT enabled for BT input mode
-# (do NOT add dtoverlay=disable-bt here — BT input mode needs it)
-# USB BT dongle is also supported via bt-init.service below.
-
-# Hardware PWM on GPIO12 for fan control (optional)
-# dtoverlay=pwm,pin=12,func=4
+enable_uart=1
+dtoverlay=miniuart-bt
+dtoverlay=w5500-driver
 CFGEOF
 
-# ── 4. UAC gadget (g_audio) ───────────────────────────────────────────────
-echo ""
-echo "[4/14] Configuring USB Audio Class gadget..."
+# Load dwc2 and g_audio modules on boot
+grep -q "^dwc2" /etc/modules || echo "dwc2" >> /etc/modules
+grep -q "^g_audio" /etc/modules || echo "g_audio" >> /etc/modules
 
-mkdir -p /etc/modprobe.d
+# g_audio config: 96kHz 32bit stereo
 cat > /etc/modprobe.d/g_audio.conf << 'EOF'
 options g_audio c_chmask=3 p_chmask=0 c_srate=96000 p_srate=96000 c_ssize=4 p_ssize=4
 EOF
 
-# Ensure g_audio loads after dwc2 at boot
-grep -q "^dwc2$"   /etc/modules 2>/dev/null || echo "dwc2"   >> /etc/modules
-grep -q "^g_audio$" /etc/modules 2>/dev/null || echo "g_audio" >> /etc/modules
-
-# ── 5. Free UART from serial console ──────────────────────────────────────
+# ── 4. Configure PipeWire for 96kHz native ──
 echo ""
-echo "[5/14] Freeing UART from serial console..."
-sed -i 's/console=serial0,[0-9]* //' /boot/firmware/cmdline.txt
-systemctl disable serial-getty@ttyAMA0.service 2>/dev/null || true
+echo "[4/9] Configuring PipeWire..."
 
-# ── 6. Snapserver ─────────────────────────────────────────────────────────
+PW_CONF_DIR="$REAL_HOME/.config/pipewire/pipewire.conf.d"
+mkdir -p "$PW_CONF_DIR"
+
+cat > "$PW_CONF_DIR/96khz.conf" << 'EOF'
+context.properties = {
+    default.clock.rate = 96000
+    default.clock.allowed-rates = [ 96000 ]
+    default.clock.quantum = 1024
+    default.clock.min-quantum = 512
+}
+EOF
+
+chown -R "$REAL_USER:$REAL_USER" "$REAL_HOME/.config"
+
+# ── 5. Configure Snapserver ──
 echo ""
-echo "[6/14] Configuring Snapserver..."
-
-SNAPFIFO="/tmp/snapfifo"
+echo "[5/9] Configuring Snapserver..."
 
 cat > /etc/snapserver.conf << 'EOF'
 [server]
@@ -144,20 +150,26 @@ EOF
 test -p /tmp/snapfifo || mkfifo /tmp/snapfifo
 chmod 666 /tmp/snapfifo
 
+# Ensure FIFO is recreated on every boot by systemd-tmpfiles
 cat > /etc/tmpfiles.d/snapfifo.conf << 'EOF'
 p /tmp/snapfifo 0666 root root -
 EOF
 
-systemctl enable snapserver
-
-# ── 7. Source services (all disabled at boot — bridge controls them) ───────
+# ── 5b. Free up UART — remove serial console ──
 echo ""
-echo "[7/14] Installing Snapcast source services..."
+echo "[5b/9] Freeing UART from serial console..."
 
-BRIDGE_DIR="/opt/esp-bridge"
-mkdir -p "$BRIDGE_DIR"
+# Remove console=serial0,xxxxx from cmdline.txt
+sed -i 's/console=serial0,[0-9]* //' /boot/firmware/cmdline.txt
 
-# ── snapcast-source (USB UAC → FIFO) — original unchanged ──
+# Disable serial login service
+systemctl disable serial-getty@ttyAMA0.service 2>/dev/null || true
+
+# ── 6. Create snapcast source services ──
+echo ""
+echo "[6/9] Creating audio capture services..."
+
+# UAC source service — original unchanged
 cat > /etc/systemd/system/snapcast-source.service << SVCEOF
 [Unit]
 Description=PipeWire UAC audio source to Snapcast FIFO
@@ -185,14 +197,14 @@ ExecStart=/bin/bash -c '\\
             sleep 1; \\
         fi; \\
     done'
-Restart=on-failure
+Restart=always
 RestartSec=2
  
 [Install]
 WantedBy=multi-user.target
 SVCEOF
- 
-# ── snapcast-sourcemic (mic → FIFO) — original unchanged ──
+
+# Mic source service — original unchanged
 cat > /etc/systemd/system/snapcast-sourcemic.service << SVCEOF
 [Unit]
 Description=PipeWire mic audio source to Snapcast FIFO
@@ -220,21 +232,18 @@ ExecStart=/bin/bash -c '\\
             sleep 1; \\
         fi; \\
     done'
-Restart=on-failure
+Restart=always
 RestartSec=2
  
 [Install]
 WantedBy=multi-user.target
 SVCEOF
- 
-# ── snapcast-sourcebt (BT → FIFO) — new addition ──
-# Same pattern as USB and mic services above — finds bluez_source.* directly
-# via pactl (PipeWire compatibility layer) and pipes straight to FIFO.
-# No PulseAudio daemon or null-sink needed — PipeWire handles BT A2DP natively.
+
+# BT source service — NEW, same pattern as above
 cat > /etc/systemd/system/snapcast-sourcebt.service << SVCEOF
 [Unit]
 Description=PipeWire BT audio source to Snapcast FIFO
-After=pipewire.service snapserver.service bt-agent.service
+After=pipewire.service snapserver.service
 Wants=pipewire.service
  
 [Service]
@@ -265,53 +274,35 @@ RestartSec=2
 WantedBy=multi-user.target
 SVCEOF
 
-# Both disabled at boot — server_bridge starts them based on input mode
+# All disabled at boot — server_bridge controls which one runs
 systemctl disable snapcast-source    2>/dev/null || true
 systemctl disable snapcast-sourcemic 2>/dev/null || true
 systemctl disable snapcast-sourcebt  2>/dev/null || true
 
-# ── 8. Bluetooth — USB dongle + auto-pair agent ───────────────────────────
+# ── 6b. Bluetooth — auto-pair agent (NEW) ──
 echo ""
-echo "[9/14] Configuring Bluetooth..."
+echo "[6b/9] Configuring Bluetooth..."
 
 # BlueZ main.conf
-sed -i 's/^#*Class\s*=.*/Class = 0x41C/'                   /etc/bluetooth/main.conf
+sed -i 's/^#*Class\s*=.*/Class = 0x41C/'                        /etc/bluetooth/main.conf
 sed -i 's/^#*DiscoverableTimeout\s*=.*/DiscoverableTimeout = 0/' /etc/bluetooth/main.conf
-sed -i 's/^#*PairableTimeout\s*=.*/PairableTimeout = 0/'   /etc/bluetooth/main.conf
-sed -i 's/^#*AlwaysPairable\s*=.*/AlwaysPairable = true/'  /etc/bluetooth/main.conf
-sed -i 's/^#*FastConnectable\s*=.*/FastConnectable = true/' /etc/bluetooth/main.conf
-sed -i 's/^#*AutoEnable\s*=.*/AutoEnable = true/'          /etc/bluetooth/main.conf
-sed -i '/^Disable=Headset/d'                                /etc/bluetooth/main.conf
+sed -i 's/^#*PairableTimeout\s*=.*/PairableTimeout = 0/'         /etc/bluetooth/main.conf
+sed -i 's/^#*AlwaysPairable\s*=.*/AlwaysPairable = true/'        /etc/bluetooth/main.conf
+sed -i 's/^#*FastConnectable\s*=.*/FastConnectable = true/'       /etc/bluetooth/main.conf
+sed -i 's/^#*AutoEnable\s*=.*/AutoEnable = true/'                /etc/bluetooth/main.conf
+sed -i '/^Disable=Headset/d'                                      /etc/bluetooth/main.conf
 sed -i 's/^#*JustWorksRepairing\s*=.*/JustWorksRepairing = always/' /etc/bluetooth/main.conf
 grep -q "JustWorksRepairing" /etc/bluetooth/main.conf || \
     sed -i '/^\[General\]/a JustWorksRepairing = always' /etc/bluetooth/main.conf
 
-# USB BT dongle init (same pattern as client)
-cat > /etc/systemd/system/bt-init.service << 'EOF'
-[Unit]
-Description=Bluetooth USB dongle init
-After=bluetooth.service
-Requires=bluetooth.service
+BRIDGE_DIR="$REAL_HOME/server_bridge"
+mkdir -p "$BRIDGE_DIR"
 
-[Service]
-Type=oneshot
-ExecStartPre=/bin/sleep 2
-ExecStart=/usr/sbin/rfkill unblock bluetooth
-ExecStart=/usr/bin/hciconfig hci0 up
-RemainAfterExit=yes
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-# bt_agent.py — identical logic to client, keeps Pi always discoverable
-# and auto-pairs any device without PIN confirmation.
 cat > "$BRIDGE_DIR/bt_agent.py" << 'PYEOF'
 #!/usr/bin/env python3
 """
-bt_agent.py — Bluetooth pairing agent for server Pi BT input mode.
-Auto-pairs NoInputNoOutput, auto-trusts, keeps adapter discoverable.
-Removes device bonding on disconnect so next pair is always fresh.
+bt_agent.py — Bluetooth auto-pair agent for server BT input mode.
+NoInputNoOutput: auto-pairs any device, sets adapter name to hostname.
 """
 import dbus
 import dbus.service
@@ -394,15 +385,13 @@ def setup_adapter(bus):
         log.error("No Bluetooth adapter found!")
         return False
     try:
-        hostname = socket.gethostname()
-        props.Set(ADAPTER_IFACE, "Alias",             dbus.String(hostname))
-        props.Set(ADAPTER_IFACE, "Powered",           dbus.Boolean(True))
-        props.Set(ADAPTER_IFACE, "Discoverable",      dbus.Boolean(True))
+        props.Set(ADAPTER_IFACE, "Alias",               dbus.String(socket.gethostname()))
+        props.Set(ADAPTER_IFACE, "Powered",             dbus.Boolean(True))
+        props.Set(ADAPTER_IFACE, "Discoverable",        dbus.Boolean(True))
         props.Set(ADAPTER_IFACE, "DiscoverableTimeout", dbus.UInt32(0))
-        props.Set(ADAPTER_IFACE, "Pairable",          dbus.Boolean(True))
-        props.Set(ADAPTER_IFACE, "PairableTimeout",   dbus.UInt32(0))
-        log.info("Adapter %s: name=%s powered=on discoverable=on pairable=on",
-                 path, hostname)
+        props.Set(ADAPTER_IFACE, "Pairable",            dbus.Boolean(True))
+        props.Set(ADAPTER_IFACE, "PairableTimeout",     dbus.UInt32(0))
+        log.info("Adapter %s: name=%s powered=on discoverable=on", path, socket.gethostname())
         return True
     except Exception as e:
         log.error("Adapter setup failed: %s", e)
@@ -433,8 +422,7 @@ def on_properties_changed(interface, changed, invalidated, path, bus):
         log.info("Device paired: %s — trusting", path)
         trust_device(bus, path)
     if "Connected" in changed:
-        state = "connected" if changed["Connected"] else "disconnected"
-        log.info("Device %s: %s", state, path)
+        log.info("Device %s: %s", path, "connected" if changed["Connected"] else "disconnected")
 
 
 def watchdog(bus):
@@ -489,17 +477,19 @@ def main():
 if __name__ == "__main__":
     main()
 PYEOF
-chmod +x "$BRIDGE_DIR/bt_agent.py"
 
-cat > /etc/systemd/system/bt-agent.service << EOF
+chmod +x "$BRIDGE_DIR/bt_agent.py"
+chown "$REAL_USER:$REAL_USER" "$BRIDGE_DIR/bt_agent.py"
+
+cat > /etc/systemd/system/bt-agent.service << 'EOF'
 [Unit]
-Description=Bluetooth Auth Agent (Python DBus) — server BT input mode
-After=bluetooth.service bt-init.service
+Description=Bluetooth Auth Agent (server BT input mode)
+After=bluetooth.service
 Requires=bluetooth.service
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/python3 ${BRIDGE_DIR}/bt_agent.py
+ExecStart=/usr/bin/python3 BRIDGE_DIR_PLACEHOLDER/bt_agent.py
 Restart=always
 RestartSec=3
 
@@ -507,136 +497,135 @@ RestartSec=3
 WantedBy=multi-user.target
 EOF
 
+# Substitute the actual path (can't use $BRIDGE_DIR inside single-quoted heredoc)
+sed -i "s|BRIDGE_DIR_PLACEHOLDER|$BRIDGE_DIR|g" /etc/systemd/system/bt-agent.service
+
 systemctl daemon-reload
-systemctl enable bt-init.service
 systemctl enable bt-agent.service
 
-# ── 10. Console autologin ─────────────────────────────────────────────────
+# ── 7. Create Server bridge service ──
 echo ""
-echo "[10/14] Enabling console autologin..."
-raspi-config nonint do_boot_behaviour B2
+echo "[7/9] Setting up Server bridge..."
 
-# ── 11. ESP Bridge (server_bridge.py) ─────────────────────────────────────
-echo ""
-echo "[11/14] Setting up server ESP bridge..."
-
-# Download bridge script from GitHub (or copy from this repo)
+# Download bridge script from GitHub
 wget -O "$BRIDGE_DIR/server_bridge.py" \
-    "https://raw.githubusercontent.com/crobin12189/snap_bridge/main/server_bridge.py" || \
-    echo "WARNING: download failed — place server_bridge.py in $BRIDGE_DIR manually"
+    "https://raw.githubusercontent.com/crobin12189/snap_bridge/main/server_bridge.py"
 
-chmod +x "$BRIDGE_DIR/server_bridge.py"
+chown -R "$REAL_USER:$REAL_USER" "$BRIDGE_DIR"
 
+# Create venv and install pyserial
+sudo -u "$REAL_USER" python3 -m venv "$BRIDGE_DIR/venv"
+sudo -u "$REAL_USER" "$BRIDGE_DIR/venv/bin/pip" install pyserial
+
+# ── Password hash file ──
 touch /etc/zone_password.hash
 chown "$REAL_USER:$REAL_USER" /etc/zone_password.hash
 chmod 640 /etc/zone_password.hash
 
-cat > /etc/systemd/system/esp-bridge-server.service << EOF
+cat > /etc/systemd/system/server_bridge.service << SVCEOF
 [Unit]
-Description=Server ESP UART Bridge (Snapcast + BT input)
-After=network.target snapserver.service bluetooth.service bt-init.service
+Description=Snapcast UART Bridge (ESP32)
+After=snapserver.service
+Wants=snapserver.service
 
 [Service]
 Type=simple
 User=$REAL_USER
-ExecStart=/usr/bin/python3 ${BRIDGE_DIR}/server_bridge.py \
-    --port /dev/ttyAMA0 \
-    --baud 460800
+Environment=XDG_RUNTIME_DIR=/run/user/$USER_ID
+ExecStart=$BRIDGE_DIR/venv/bin/python3 $BRIDGE_DIR/server_bridge.py --port /dev/ttyAMA0 --baud 460800
 Restart=always
 RestartSec=3
-Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/${USER_ID}/bus
-Environment=XDG_RUNTIME_DIR=/run/user/${USER_ID}
 
 [Install]
 WantedBy=multi-user.target
-EOF
+SVCEOF
+
+# ── 8. Sudoers for snapserver restart ──
+echo ""
+echo "[8/9] Configuring sudoers..."
+
+cat > /etc/sudoers.d/snapserver-restart << SUDOEOF
+$REAL_USER ALL=(ALL) NOPASSWD: /usr/bin/systemctl restart snapserver
+$REAL_USER ALL=(ALL) NOPASSWD: /usr/bin/systemctl start snapcast-source
+$REAL_USER ALL=(ALL) NOPASSWD: /bin/systemctl start snapcast-source
+$REAL_USER ALL=(ALL) NOPASSWD: /usr/bin/systemctl stop snapcast-source
+$REAL_USER ALL=(ALL) NOPASSWD: /bin/systemctl stop snapcast-source
+$REAL_USER ALL=(ALL) NOPASSWD: /usr/bin/systemctl start snapcast-sourcemic
+$REAL_USER ALL=(ALL) NOPASSWD: /bin/systemctl start snapcast-sourcemic
+$REAL_USER ALL=(ALL) NOPASSWD: /usr/bin/systemctl stop snapcast-sourcemic
+$REAL_USER ALL=(ALL) NOPASSWD: /bin/systemctl stop snapcast-sourcemic
+$REAL_USER ALL=(ALL) NOPASSWD: /usr/bin/systemctl start snapcast-sourcebt
+$REAL_USER ALL=(ALL) NOPASSWD: /bin/systemctl start snapcast-sourcebt
+$REAL_USER ALL=(ALL) NOPASSWD: /usr/bin/systemctl stop snapcast-sourcebt
+$REAL_USER ALL=(ALL) NOPASSWD: /bin/systemctl stop snapcast-sourcebt
+$REAL_USER ALL=(ALL) NOPASSWD: /usr/bin/systemctl start bt-agent
+$REAL_USER ALL=(ALL) NOPASSWD: /bin/systemctl start bt-agent
+$REAL_USER ALL=(ALL) NOPASSWD: /usr/bin/systemctl stop bt-agent
+$REAL_USER ALL=(ALL) NOPASSWD: /bin/systemctl stop bt-agent
+SUDOEOF
+chmod 440 /etc/sudoers.d/snapserver-restart
+
+# Add user to dialout group for UART access
+usermod -aG dialout "$REAL_USER"
+usermod -aG gpio "$REAL_USER"
+usermod -aG bluetooth "$REAL_USER"
+
+# Enable linger so PipeWire (user service) starts at boot without login
+loginctl enable-linger "$REAL_USER"
+
+# ── 9. Enable services ──
+echo ""
+echo "[9/9] Enabling services..."
 
 systemctl daemon-reload
-systemctl enable esp-bridge-server.service
+systemctl enable snapserver
+systemctl enable server_bridge
 
-# ── 12. Sudoers ───────────────────────────────────────────────────────────
-echo ""
-echo "[12/14] Configuring sudoers..."
-
-cat > /etc/sudoers.d/esp-bridge-server << EOF
-$REAL_USER ALL=(ALL) NOPASSWD: /bin/systemctl start  snapcast-source
-$REAL_USER ALL=(ALL) NOPASSWD: /bin/systemctl stop   snapcast-source
-$REAL_USER ALL=(ALL) NOPASSWD: /bin/systemctl start  snapcast-sourcemic
-$REAL_USER ALL=(ALL) NOPASSWD: /bin/systemctl stop   snapcast-sourcemic
-$REAL_USER ALL=(ALL) NOPASSWD: /bin/systemctl start  snapcast-sourcebt
-$REAL_USER ALL=(ALL) NOPASSWD: /bin/systemctl stop   snapcast-sourcebt
-$REAL_USER ALL=(ALL) NOPASSWD: /bin/systemctl restart snapserver
-$REAL_USER ALL=(ALL) NOPASSWD: /bin/systemctl start  bt-agent
-$REAL_USER ALL=(ALL) NOPASSWD: /bin/systemctl stop   bt-agent
+cat > /etc/sysctl.d/99-tcp-retries.conf << 'EOF'
+net.ipv4.tcp_retries2 = 3
+net.ipv4.tcp_keepalive_time = 5
+net.ipv4.tcp_keepalive_intvl = 2
+net.ipv4.tcp_keepalive_probes = 3
 EOF
-chmod 440 /etc/sudoers.d/esp-bridge-server
+sudo sysctl -p /etc/sysctl.d/99-tcp-retries.conf
 
-# ── 13. Avahi mDNS — IPv4 only ───────────────────────────────────────────
+# ── Static IP for eth0 ──
 echo ""
-echo "[13/14] Configuring Avahi..."
-
-if grep -q "^use-ipv6" /etc/avahi/avahi-daemon.conf; then
-    sed -i 's/^#*use-ipv6\s*=.*/use-ipv6=no/' /etc/avahi/avahi-daemon.conf
-elif grep -q "^#.*use-ipv6" /etc/avahi/avahi-daemon.conf; then
-    sed -i 's/^#.*use-ipv6.*/use-ipv6=no/' /etc/avahi/avahi-daemon.conf
-else
-    sed -i '/^\[server\]/a use-ipv6=no' /etc/avahi/avahi-daemon.conf
-fi
-
-# ── 14. Network — static IP for eth0 ─────────────────────────────────────
-echo ""
-echo "[14/14] Configuring static IP for eth0..."
+echo "Configuring static IP for eth0..."
 
 nmcli con add type ethernet ifname eth0 con-name ethernet \
-    ip4 "$STATIC_IP/$SUBNET" gw4 "$GATEWAY"
+  ip4 "$STATIC_IP/$SUBNET" gw4 "$GATEWAY"
 nmcli con mod ethernet ipv4.dns "$DNS"
 nmcli con mod ethernet ipv4.method manual
 
-[[ "$DISABLE_WIFI" =~ ^[Yy]$ ]] && nmcli radio wifi off
-
-loginctl enable-linger "$REAL_USER"
-
-# ── Clean up PipeWire leftovers ───────────────────────────────────────────
-rm -rf "$REAL_HOME/.config/wireplumber"  2>/dev/null || true
-rm -rf "$REAL_HOME/.config/pipewire"     2>/dev/null || true
+if [[ "$DISABLE_WIFI" =~ ^[Yy]$ ]]; then
+    nmcli radio wifi off
+fi
 
 echo ""
 echo "========================================="
 echo " Setup complete!"
 echo ""
-echo " Services:"
-echo "   snapserver       — Snapcast server (creates and reads /tmp/snapfifo)"
-echo "   snapserver       — Snapcast server (reads FIFO)"
-echo "   bt-init          — USB BT dongle init"
-echo "   bt-agent         — auto-pair agent (started by bridge in BT mode)"
-echo "   esp-bridge-server — server_bridge.py"
+echo " Services installed:"
+echo "   - snapserver (audio streaming)"
+echo "   - snapcast-source (USB audio capture)"
+echo "   - snapcast-sourcemic (mic audio capture)"
+echo "   - snapcast-sourcebt (Bluetooth audio capture) [NEW]"
+echo "   - bt-agent (Bluetooth auto-pair agent) [NEW]"
+echo "   - server_bridge (ESP32 communication)"
 echo ""
-echo " Input mode services (bridge-controlled, all disabled at boot):"
-echo "   snapcast-source    — USB/UAC phone input"
-echo "   snapcast-sourcemic — microphone input"
-echo "   snapcast-sourcebt  — Bluetooth A2DP input (via PulseAudio)"
+echo " UART bridge script location:"
+echo "   $BRIDGE_DIR/server_bridge.py"
 echo ""
-echo " BT input mode flow:"
-echo "   ESP sends MSG_INPUT_SET(2) → bridge starts PA + bt-agent + snapcast-sourcebt"
-echo "   Phone pairs (auto) → A2DP source appears in PA"
-echo "   Bridge polls every 2s, detects source, loads module-loopback:"
-echo "     bluez_source.* → bt_snapcast_sink → parec → /tmp/snapfifo → snapserver"
-echo ""
-echo " Key files:"
+echo " Config files:"
 echo "   /etc/snapserver.conf"
 echo "   /etc/modprobe.d/g_audio.conf"
-echo "   /etc/bluetooth/main.conf"
-echo "   /etc/pulse/daemon.conf"
-echo "   /etc/zone_password.hash"
-echo "   ${BRIDGE_DIR}/"
-echo ""
-echo " Wiring:"
-echo "   GPIO14 (TX) → ESP RX"
-echo "   GPIO15 (RX) → ESP TX"
-echo "   USB-C data splitter → phone (UAC gadget)"
+echo "   $PW_CONF_DIR/96khz.conf"
 echo ""
 echo " Network:"
-echo "   eth0 static: $STATIC_IP/$SUBNET  gw $GATEWAY"
+echo "   eth0 static IP: $STATIC_IP/$SUBNET"
+echo "   Gateway:        $GATEWAY"
+echo "   DNS:            $DNS"
 echo ""
 echo " REBOOT NOW to apply all changes:"
 echo "   sudo reboot"
