@@ -87,13 +87,8 @@ enable_uart=1
 
 # USB-C UAC gadget mode (phone → Pi as USB audio device)
 dtoverlay=dwc2,dr_mode=peripheral
+dtoverlay=disable-bt
 
-# Bluetooth — keep onboard BT enabled for BT input mode
-# (do NOT add dtoverlay=disable-bt here — BT input mode needs it)
-# USB BT dongle is also supported via bt-init.service below.
-
-# Hardware PWM on GPIO12 for fan control (optional)
-# dtoverlay=pwm,pin=12,func=4
 CFGEOF
 
 # ── 4. UAC gadget (g_audio) ───────────────────────────────────────────────
