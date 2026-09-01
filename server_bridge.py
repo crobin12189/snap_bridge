@@ -42,6 +42,7 @@ MSG_POWER_STATE     = 0x22
 MSG_POWER_PENDING   = 0x23
 MSG_MIC_STATUS      = 0x24
 MSG_BT_STATUS       = 0x26   # present(1) — ESP side handled later
+MSG_INPUT_STATUS    = 0x27   # Pi → ESP: current input mode (0=usb,1=mic,2=bt)
 MSG_PW_SET          = 0x30
 MSG_RENAME          = 0x33
 MSG_PW_ACK          = 0x34
@@ -844,6 +845,7 @@ class ServerBridge:
                 log.error("Snap status on INIT failed: %s", e)
             self._send_client_list()
             self.send_frame(MSG_PW_ACK, bytes([1 if self._pw_user_set else 0]))
+            self.send_frame(MSG_INPUT_STATUS, bytes([self._input_mode]))
             threading.Thread(
                 target=self._apply_input_mode,
                 args=(self._input_mode,),
@@ -1021,15 +1023,33 @@ class ServerBridge:
                 log.error("Snap refresh failed: %s", e)
 
     # ── Input mode switch ─────────────────────────────────────────────────
+    def _suspend_alsa_inputs(self, suspend: bool):
+        """Suspend or unsuspend all ALSA input sources in PipeWire.
+        When suspend=True, prevents PipeWire from mixing mic into BT capture.
+        When suspend=False, restores them for USB/mic modes."""
+        flag = "1" if suspend else "0"
+        action = "Suspending" if suspend else "Unsuspending"
+        try:
+            result = subprocess.run(["pactl", "list", "sources", "short"],
+                                    capture_output=True, text=True, timeout=5)
+            for line in result.stdout.splitlines():
+                if "alsa_input" in line:
+                    name = line.split()[1]
+                    subprocess.run(["pactl", "suspend-source", name, flag],
+                                   timeout=5, check=False, capture_output=True)
+                    log.info("%s ALSA input: %s", action, name)
+        except Exception as e:
+            log.warning("suspend_alsa_inputs failed: %s", e)
+
     def _apply_input_mode(self, mode: int):
         """
         Switch the snapserver FIFO source. Serialized by _input_mode_lock so
         rapid mode changes or concurrent ESP reconnects don't race.
 
-        BT services (PulseAudio, bt-agent) are started once when BT mode is
-        first selected and left running permanently — they don't interfere with
-        USB/mic pipelines which write directly to the FIFO via ALSA, bypassing
-        PulseAudio entirely. Only the active source service changes.
+        BT mode: ALSA input sources are suspended so PipeWire cannot mix mic
+        audio into the BT capture stream (which would happen when BT is paused
+        and PipeWire falls back to mixing other active sources).
+        USB/mic modes: ALSA inputs are unsuspended.
         """
         if not self._input_mode_lock.acquire(blocking=True, timeout=30):
             log.error("Input mode switch timed out waiting for lock — skipping")
@@ -1041,6 +1061,7 @@ class ServerBridge:
                                timeout=10, check=False, capture_output=True)
                 subprocess.run(["sudo", "systemctl", "stop", "snapcast-sourcebt"],
                                timeout=10, check=False, capture_output=True)
+                self._suspend_alsa_inputs(False)
                 subprocess.run(["sudo", "systemctl", "start", "snapcast-source"],
                                timeout=10, check=False, capture_output=True)
                 log.info("Input: USB/UAC active")
@@ -1051,6 +1072,7 @@ class ServerBridge:
                                timeout=10, check=False, capture_output=True)
                 subprocess.run(["sudo", "systemctl", "stop", "snapcast-sourcebt"],
                                timeout=10, check=False, capture_output=True)
+                self._suspend_alsa_inputs(False)
                 subprocess.run(["sudo", "systemctl", "start", "snapcast-sourcemic"],
                                timeout=10, check=False, capture_output=True)
                 log.info("Input: mic active")
@@ -1061,7 +1083,9 @@ class ServerBridge:
                                timeout=10, check=False, capture_output=True)
                 subprocess.run(["sudo", "systemctl", "stop", "snapcast-sourcemic"],
                                timeout=10, check=False, capture_output=True)
-                # Start PA + bt-agent only if not already running
+                # Suspend ALSA inputs so PipeWire cannot mix mic into BT capture
+                # when BT stream is paused/suspended by the phone
+                self._suspend_alsa_inputs(True)
                 self._ensure_bt_services()
                 subprocess.run(["sudo", "systemctl", "start", "snapcast-sourcebt"],
                                timeout=10, check=False, capture_output=True)
