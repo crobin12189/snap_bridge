@@ -231,31 +231,27 @@ cat > /etc/systemd/system/snapcast-sourcebt.service << SVCEOF
 Description=PipeWire BT audio source to Snapcast FIFO
 After=pipewire.service snapserver.service bt-agent.service
 Wants=pipewire.service
- 
+
 [Service]
 Type=simple
-User=$REAL_USER
-Environment=XDG_RUNTIME_DIR=/run/user/$USER_ID
+User=admin
+Environment=XDG_RUNTIME_DIR=/run/user/1000
 ExecStartPre=/bin/bash -c 'test -p /tmp/snapfifo || mkfifo /tmp/snapfifo'
-ExecStart=/bin/bash -c '\\
-    while true; do \\
-        DEVICE=\$(pactl list sources short | grep "bluez_source" | grep -v monitor | awk "{print \\\$2}" | head -1); \\
-        if [ -n "\$DEVICE" ]; then \\
-            parec \\
-                --device=\$DEVICE \\
-                --format=s32le \\
-                --rate=96000 \\
-                --channels=2 \\
-                --latency-msec=10 \\
-                --process-time-msec=5 \\
-            > /tmp/snapfifo || true; \\
-        else \\
-            sleep 1; \\
-        fi; \\
-    done'
+ExecStartPre=/bin/bash -c 'pactl load-module module-null-sink sink_name=bt_mix sink_properties=device.description=bt_mix 2>/dev/null || true'
+ExecStartPre=/bin/bash -c 'pactl load-module module-loopback source=bluez_source.$(pactl list sources short | grep bluez_source | grep -v monitor | awk "{print \$2}" | head -1 | sed "s/bluez_source.//") sink=bt_mix latency_msec=500 2>/dev/null || true'
+ExecStart=/bin/bash -c '\
+    parec \
+        --device=bt_mix.monitor \
+        --format=s32le \
+        --rate=96000 \
+        --channels=2 \
+        --latency-msec=50 \
+        --process-time-msec=10 \
+    > /tmp/snapfifo'
+ExecStopPost=/bin/bash -c 'pactl unload-module module-loopback 2>/dev/null || true; pactl unload-module module-null-sink 2>/dev/null || true'
 Restart=on-failure
 RestartSec=2
- 
+
 [Install]
 WantedBy=multi-user.target
 SVCEOF
