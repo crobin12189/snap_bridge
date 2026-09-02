@@ -30,7 +30,7 @@ MSG_MODE_SYNC       = 0x05
 MSG_MODE_BT         = 0x06
 MSG_POWER_SET       = 0x07
 MSG_RESTART_SERVER  = 0x09
-MSG_INPUT_SET       = 0x0A   # 0=usb, 1=mic, 2=bt
+MSG_INPUT_SET       = 0x0A
 MSG_MIC_GAIN_SET    = 0x0B
 MSG_ACK             = 0x10
 MSG_CLIENT_LIST     = 0x11
@@ -41,8 +41,8 @@ MSG_MODE_SWITCHING  = 0x21
 MSG_POWER_STATE     = 0x22
 MSG_POWER_PENDING   = 0x23
 MSG_MIC_STATUS      = 0x24
-MSG_BT_STATUS       = 0x26   # present(1) — ESP side handled later
-MSG_INPUT_STATUS    = 0x27   # Pi → ESP: current input mode (0=usb,1=mic,2=bt)
+MSG_BT_STATUS       = 0x26
+MSG_INPUT_STATUS    = 0x27
 MSG_PW_SET          = 0x30
 MSG_RENAME          = 0x33
 MSG_PW_ACK          = 0x34
@@ -91,7 +91,7 @@ def build_frame(msg_type: int, payload: bytes = b"") -> bytes:
 
 
 def _find_mic_source() -> Optional[str]:
-    """Same selection rule as snapcast-sourcemic.service's DEVICE lookup."""
+    """USB mic dongle: alsa_input.usb-* but NOT the UAC gadget (platform-)."""
     try:
         result = subprocess.run(["pactl", "list", "sources", "short"],
                                 capture_output=True, text=True, timeout=5)
@@ -100,10 +100,29 @@ def _find_mic_source() -> Optional[str]:
             if len(parts) < 2:
                 continue
             name = parts[1]
-            if "alsa_input" in name and "monitor" not in name and "platform-" not in name:
+            if (name.startswith("alsa_input.usb-")
+                    and "monitor" not in name):
                 return name
     except Exception as e:
         log.warning("_find_mic_source error: %s", e)
+    return None
+
+
+def _find_uac_source() -> Optional[str]:
+    """UAC gadget (phone audio in): alsa_input.platform-*"""
+    try:
+        result = subprocess.run(["pactl", "list", "sources", "short"],
+                                capture_output=True, text=True, timeout=5)
+        for line in result.stdout.splitlines():
+            parts = line.split()
+            if len(parts) < 2:
+                continue
+            name = parts[1]
+            if (name.startswith("alsa_input.platform-")
+                    and "monitor" not in name):
+                return name
+    except Exception as e:
+        log.warning("_find_uac_source error: %s", e)
     return None
 
 
@@ -120,7 +139,7 @@ def _get_source_gain(source: str) -> Optional[int]:
 
 
 def _find_bt_source() -> Optional[str]:
-    """Find the active A2DP Bluetooth source in PulseAudio."""
+    """Find the active A2DP Bluetooth source in PulseAudio/PipeWire."""
     try:
         result = subprocess.run(["pactl", "list", "sources", "short"],
                                 capture_output=True, text=True, timeout=5)
@@ -364,7 +383,7 @@ class ClientRecord:
         try:
             sock.sendall((json.dumps(msg) + "\n").encode())
         except BlockingIOError:
-            log.warning("ctrl_send to %s: send buffer busy, skipping this cycle", self.name)
+            log.warning("ctrl_send to %s: send buffer busy, skipping", self.name)
         except Exception as e:
             log.warning("ctrl_send to %s failed: %s", self.name, e)
             with self._sock_lock:
@@ -458,19 +477,16 @@ class ServerBridge:
         self._esp_vol_set_time      = {}
         self._running               = True
 
-        # Input mode — 0=usb, 1=mic, 2=bt
-        self._input_mode    = INPUT_USB
+        self._input_mode      = INPUT_USB
         self._input_mode_lock = threading.Lock()
 
-        # Mic state
-        self._mic_present   = False
-        self._mic_gain      = 50
+        self._mic_present    = False
+        self._mic_gain       = 50
         self._last_mic_check = 0.0
 
-        # BT state
-        self._bt_present       = False
-        self._bt_dev_name      = ""
-        self._last_bt_check    = 0.0
+        self._bt_present    = False
+        self._bt_dev_name   = ""
+        self._last_bt_check = 0.0
 
         self._pw_hash, self._pw_user_set = load_or_init_password()
         self._hash_pull_server = HashPullServer(lambda: self._pw_hash)
@@ -575,7 +591,8 @@ class ServerBridge:
         rec.powered        = msg.get("powered",        False)
 
         if rec.pending_power is not None:
-            log.info("Delivering queued power=%s to %s on reconnect", rec.pending_power, rec.name)
+            log.info("Delivering queued power=%s to %s on reconnect",
+                     rec.pending_power, rec.name)
             rec.ctrl_send({"type": "set_powered", "powered": rec.pending_power})
             rec.pending_power = None
 
@@ -908,19 +925,14 @@ class ServerBridge:
         elif msg_type == MSG_INPUT_SET:
             if len(payload) < 1:
                 return
-            mode = payload[0]   # 0=usb, 1=mic, 2=bt
+            mode = payload[0]
             self._input_mode = mode
-            log.info("Input mode set: %s", {0:"usb",1:"mic",2:"bt"}.get(mode, str(mode)))
+            log.info("Input mode set: %s", {0: "usb", 1: "mic", 2: "bt"}.get(mode, str(mode)))
             threading.Thread(
                 target=self._apply_input_mode,
                 args=(mode,),
                 daemon=True,
             ).start()
-            # Immediately poll the new source so ESP gets a status update quickly
-            if mode == INPUT_MIC:
-                threading.Thread(target=self._poll_mic_status, args=(True,), daemon=True).start()
-            elif mode == INPUT_BT:
-                threading.Thread(target=self._poll_bt_status, args=(True,), daemon=True).start()
 
         elif msg_type == MSG_RESTART_SERVER:
             log.info("ESP requested snapserver restart")
@@ -1024,10 +1036,8 @@ class ServerBridge:
 
     # ── Input mode switch ─────────────────────────────────────────────────
     def _suspend_alsa_inputs(self, suspend: bool):
-        """Suspend or unsuspend all ALSA input sources in PipeWire.
-        When suspend=True, prevents PipeWire from mixing mic into BT capture.
-        When suspend=False, restores them for USB/mic modes."""
-        flag = "1" if suspend else "0"
+        """Suspend or unsuspend all ALSA input sources in PipeWire."""
+        flag   = "1" if suspend else "0"
         action = "Suspending" if suspend else "Unsuspending"
         try:
             result = subprocess.run(["pactl", "list", "sources", "short"],
@@ -1043,16 +1053,12 @@ class ServerBridge:
 
     def _apply_input_mode(self, mode: int):
         """
-        Switch the snapserver FIFO source. Serialized by _input_mode_lock so
-        rapid mode changes or concurrent ESP reconnects don't race.
-
-        BT mode: ALSA input sources are suspended so PipeWire cannot mix mic
-        audio into the BT capture stream (which would happen when BT is paused
-        and PipeWire falls back to mixing other active sources).
-        USB/mic modes: ALSA inputs are unsuspended.
+        Switch the snapserver FIFO source. Serialized by _input_mode_lock.
+        BT mode: null-sink + loopback managed by poll loop; service reads
+        the stable bt_mix.monitor so parec never dies on phone pause/resume.
         """
         if not self._input_mode_lock.acquire(blocking=True, timeout=30):
-            log.error("Input mode switch timed out waiting for lock — skipping")
+            log.error("Input mode switch timed out — skipping")
             return
         try:
             if mode == INPUT_USB:
@@ -1061,6 +1067,8 @@ class ServerBridge:
                                timeout=10, check=False, capture_output=True)
                 subprocess.run(["sudo", "systemctl", "stop", "snapcast-sourcebt"],
                                timeout=10, check=False, capture_output=True)
+                self._remove_bt_loopback()
+                self._remove_bt_null_sink()
                 self._suspend_alsa_inputs(False)
                 subprocess.run(["sudo", "systemctl", "start", "snapcast-source"],
                                timeout=10, check=False, capture_output=True)
@@ -1072,10 +1080,14 @@ class ServerBridge:
                                timeout=10, check=False, capture_output=True)
                 subprocess.run(["sudo", "systemctl", "stop", "snapcast-sourcebt"],
                                timeout=10, check=False, capture_output=True)
+                self._remove_bt_loopback()
+                self._remove_bt_null_sink()
                 self._suspend_alsa_inputs(False)
                 subprocess.run(["sudo", "systemctl", "start", "snapcast-sourcemic"],
                                timeout=10, check=False, capture_output=True)
                 log.info("Input: mic active")
+                # Poll after service settles — source appears ~1.5s after start
+                threading.Thread(target=self._delayed_mic_poll, daemon=True).start()
 
             elif mode == INPUT_BT:
                 log.info("Switching input to Bluetooth")
@@ -1083,10 +1095,18 @@ class ServerBridge:
                                timeout=10, check=False, capture_output=True)
                 subprocess.run(["sudo", "systemctl", "stop", "snapcast-sourcemic"],
                                timeout=10, check=False, capture_output=True)
-                # Suspend ALSA inputs so PipeWire cannot mix mic into BT capture
-                # when BT stream is paused/suspended by the phone
                 self._suspend_alsa_inputs(True)
                 self._ensure_bt_services()
+                # Create stable sink BEFORE starting service so bt_mix.monitor
+                # exists when parec opens it
+                self._ensure_bt_null_sink()
+                # Wire loopback now if phone already connected
+                source = _find_bt_source()
+                if source:
+                    self._ensure_bt_loopback(source)
+                    log.info("BT source already present, loopback wired: %s", source)
+                else:
+                    log.info("BT source not yet present — poll loop will wire loopback")
                 subprocess.run(["sudo", "systemctl", "start", "snapcast-sourcebt"],
                                timeout=10, check=False, capture_output=True)
                 log.info("Input: Bluetooth active")
@@ -1101,8 +1121,6 @@ class ServerBridge:
 
     # ── BT service control ────────────────────────────────────────────────
     def _ensure_bt_services(self):
-        """Start bt-agent if not already running. PipeWire handles BT A2DP natively
-        so no PulseAudio or loopback management needed on the server."""
         try:
             subprocess.run(["sudo", "systemctl", "start", "bt-agent"],
                            timeout=10, check=False, capture_output=True)
@@ -1110,15 +1128,117 @@ class ServerBridge:
         except Exception as e:
             log.error("bt-agent start failed: %s", e)
 
-    # ── BT status ─────────────────────────────────────────────────────────
+    # ── BT loopback management ────────────────────────────────────────────
+    def _pa_module_loaded(self, name: str) -> Optional[int]:
+        """Return module index if a module matching 'name' is loaded, else None."""
+        try:
+            result = subprocess.run(["pactl", "list", "modules", "short"],
+                                    capture_output=True, text=True, timeout=5)
+            for line in result.stdout.splitlines():
+                if name in line:
+                    parts = line.split()
+                    if parts:
+                        try:
+                            return int(parts[0])
+                        except ValueError:
+                            pass
+        except Exception as e:
+            log.warning("_pa_module_loaded error: %s", e)
+        return None
+
+    def _ensure_bt_null_sink(self) -> bool:
+        """Load bt_mix null-sink if not already loaded. Returns True if present."""
+        if self._pa_module_loaded("bt_mix") is not None:
+            return True
+        try:
+            result = subprocess.run(
+                ["pactl", "load-module", "module-null-sink",
+                 "sink_name=bt_mix",
+                 "sink_properties=device.description=bt_mix"],
+                capture_output=True, text=True, timeout=5)
+            idx = result.stdout.strip()
+            if idx.isdigit():
+                log.info("Loaded bt_mix null-sink (module %s)", idx)
+                return True
+            log.warning("bt_mix load failed: %s", result.stderr.strip())
+        except Exception as e:
+            log.warning("_ensure_bt_null_sink error: %s", e)
+        return False
+
+    def _ensure_bt_loopback(self, source: str) -> bool:
+        """Load loopback from source → bt_mix if not already loaded for this source."""
+        tag = f"source={source}"
+        if self._pa_module_loaded(tag) is not None:
+            return True
+        # Remove any stale loopback pointing to a different BT source first
+        self._remove_bt_loopback()
+        try:
+            result = subprocess.run(
+                ["pactl", "load-module", "module-loopback",
+                 f"source={source}",
+                 "sink=bt_mix",
+                 "latency_msec=500"],
+                capture_output=True, text=True, timeout=5)
+            idx = result.stdout.strip()
+            if idx.isdigit():
+                log.info("Loaded BT loopback %s → bt_mix (module %s)", source, idx)
+                return True
+            log.warning("BT loopback load failed: %s", result.stderr.strip())
+        except Exception as e:
+            log.warning("_ensure_bt_loopback error: %s", e)
+        return False
+
+    def _remove_bt_loopback(self):
+        """Unload all loopback modules pointing to any bluez_source."""
+        try:
+            result = subprocess.run(["pactl", "list", "modules", "short"],
+                                    capture_output=True, text=True, timeout=5)
+            for line in result.stdout.splitlines():
+                if "module-loopback" in line and "bluez_source" in line:
+                    parts = line.split()
+                    if parts and parts[0].isdigit():
+                        subprocess.run(["pactl", "unload-module", parts[0]],
+                                       timeout=5, capture_output=True)
+                        log.info("Unloaded stale BT loopback module %s", parts[0])
+        except Exception as e:
+            log.warning("_remove_bt_loopback error: %s", e)
+
+    def _remove_bt_null_sink(self):
+        """Unload bt_mix null-sink."""
+        try:
+            result = subprocess.run(["pactl", "list", "modules", "short"],
+                                    capture_output=True, text=True, timeout=5)
+            for line in result.stdout.splitlines():
+                if "bt_mix" in line:
+                    parts = line.split()
+                    if parts and parts[0].isdigit():
+                        subprocess.run(["pactl", "unload-module", parts[0]],
+                                       timeout=5, capture_output=True)
+                        log.info("Unloaded bt_mix null-sink module %s", parts[0])
+        except Exception as e:
+            log.warning("_remove_bt_null_sink error: %s", e)
+
+    # ── BT status polling ─────────────────────────────────────────────────
     def _poll_bt_status(self, force: bool = False):
         """
-        Check whether a BT A2DP source is visible to PipeWire via pactl.
-        snapcast-sourcebt handles capture directly — bridge just tracks
-        presence for status reporting to the ESP.
+        Poll BT source every BT_CHECK_INTERVAL_S while in BT mode.
+        Manages loopback lifecycle: wire on appearance, tear down on
+        disappearance so it rebuilds cleanly when phone resumes.
+        parec on bt_mix.monitor stays alive throughout — no pause/play needed.
         """
         source  = _find_bt_source()
         present = source is not None
+
+        if present:
+            sink_ok     = self._ensure_bt_null_sink()
+            loopback_ok = self._ensure_bt_loopback(source) if sink_ok else False
+            if not loopback_ok:
+                log.warning("BT pipeline not fully established yet")
+        elif self._bt_present and not present:
+            # Source just disappeared — tear down loopback so it rebuilds
+            # fresh when the phone resumes (avoids stale module on dead source)
+            log.info("BT source gone — tearing down loopback")
+            self._remove_bt_loopback()
 
         if present != self._bt_present:
             self._bt_present = present
@@ -1133,6 +1253,15 @@ class ServerBridge:
                 self._send_bt_status()
         elif force and self._esp_connected:
             self._send_bt_status()
+
+    # ── Mic status polling ────────────────────────────────────────────────
+    def _delayed_mic_poll(self):
+        """Poll mic status 1.5s after switching to mic mode so the ALSA
+        source has time to appear in pactl after snapcast-sourcemic starts."""
+        time.sleep(1.5)
+        if self._input_mode == INPUT_MIC:
+            self._poll_mic_status(force=True)
+
     def _poll_mic_status(self, force: bool = False):
         source  = _find_mic_source()
         present = source is not None
