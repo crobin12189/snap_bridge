@@ -691,8 +691,27 @@ wget -O "$BRIDGE_DIR/server_bridge.py" \
 
 chmod +x "$BRIDGE_DIR/server_bridge.py"
 
+# ── Free ttyS0 from the serial console ────────────────────────────────────
+# ttyS0 IS the 3-pin debug header on the Zero 3 (TX/RX/GND next to USB-C).
+# By default Armbian/orangepiEnv.txt attaches the login console to it
+# (console=ttyS0,115200 in extraargs) and runs a getty on it. If that's
+# left in place, the console and the ESP bridge will both read/write the
+# same UART — garbled bytes at best, a live root login prompt fighting
+# your bridge traffic at worst. Free it the same way the RPi script frees
+# ttyAMA0 in its own setup.
+ENV_FILE="/boot/orangepiEnv.txt"
+if [ -f "$ENV_FILE" ]; then
+    cp "$ENV_FILE" "${ENV_FILE}.bak"
+    # Strip "console=ttyS0,115200" (or any baud) out of extraargs, wherever it sits
+    sed -i -E 's/console=ttyS0,[0-9]+ ?//g' "$ENV_FILE"
+fi
+systemctl disable serial-getty@ttyS0.service 2>/dev/null || true
+systemctl stop    serial-getty@ttyS0.service 2>/dev/null || true
+
 # Fix ttyS0 permissions — OPi assigns it to console user by default
 cat > /etc/udev/rules.d/99-ttys0.rules << 'EOF'
+# ttyS0 = the dedicated 3-pin debug header (TX/RX/GND) on the Zero 3,
+# repurposed here for ESP32 comms instead of serial console/login.
 KERNEL=="ttyS0", GROUP="dialout", MODE="0660"
 EOF
 udevadm control --reload-rules
@@ -703,9 +722,6 @@ chmod 660 /dev/ttyS0 2>/dev/null || true
 touch /etc/zone_password.hash
 chown "$REAL_USER:$REAL_USER" /etc/zone_password.hash
 chmod 640 /etc/zone_password.hash
-
-# OPi Zero 3 UART: use UART5 on PH2/PH3 = /dev/ttyS5
-# Make sure to enable it in orangepiEnv.txt if not already
 
 cat > /etc/systemd/system/esp-bridge-server.service << EOF
 [Unit]
@@ -836,15 +852,19 @@ echo "   snapcast-sourcebt  — Bluetooth A2DP input"
 echo ""
 echo " Key OPi Zero 3 differences vs RPi:"
 echo "   - No /boot/firmware/config.txt — uses /boot/orangepiEnv.txt"
-echo "   - UART5 on PH2(TX)/PH3(RX) = /dev/ttyS5"
+echo "   - ESP32 UART is /dev/ttyS0 = the 3-pin debug header (freed from"
+echo "     serial console/getty by this script — do NOT re-enable console"
+echo "     on ttyS0 or it will fight the bridge for the same UART)"
 echo "   - hci0 = onboard (disabled via udev), hci1 = USB dongle"
 echo "   - UAC via libcomposite (musb-hdrc OTG), not dwc2"
 echo "   - dbus-user-session required for PulseAudio BT"
 echo ""
 echo " Wiring (OPi Zero 3 pinout):"
-echo "   Debug header TX → ESP32 RX"
-echo "   Debug header RX → ESP32 TX"
+echo "   Debug header TX  → ESP32 RX"
+echo "   Debug header RX  → ESP32 TX"
 echo "   Debug header GND → ESP32 GND"
+echo "   (this is the same 3-pin header used for serial console by"
+echo "    default — this script disabled that console for you)"
 echo "   USB-C → phone (UAC gadget)"
 echo ""
 echo " Network:"
