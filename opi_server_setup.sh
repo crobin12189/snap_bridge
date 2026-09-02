@@ -772,6 +772,14 @@ wifi.scan-rand-mac-address=no
 [main]
 wifi.backend=none
 EOF
+    # Also remove wlan0 from /etc/network/interfaces if present
+    if [ -f /etc/network/interfaces ]; then
+        sed -i '/auto wlan0/d' /etc/network/interfaces
+        sed -i '/iface wlan0/d' /etc/network/interfaces
+        sed -i '/wpa-conf/d' /etc/network/interfaces
+    fi
+    # Remove wpa_supplicant conf
+    rm -f /etc/wpa_supplicant/wpa_supplicant.conf
     echo "WiFi disabled."
 fi
 
