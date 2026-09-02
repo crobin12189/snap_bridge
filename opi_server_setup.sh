@@ -43,7 +43,7 @@ read -rp "Confirm? [y/N]: " CONFIRM
 
 # ── Create new user with full sudo ────────────────────────────────────────
 echo ""
-echo "[0/13] Creating new admin user: $NEW_USER..."
+echo "[0/14] Creating new admin user: $NEW_USER..."
 
 useradd -m -s /bin/bash "$NEW_USER"
 echo "$NEW_USER:$NEW_PASS" | chpasswd
@@ -95,10 +95,6 @@ apt-mark hold pulseaudio pulseaudio-module-bluetooth pulseaudio-utils snapserver
 for grp in pulse pulse-access gpio; do
     getent group "$grp" &>/dev/null && usermod -aG "$grp" "$NEW_USER" || true
 done
-
-usermod -a -G bluetooth "$REAL_USER"
-usermod -a -G dialout   "$REAL_USER"
-usermod -a -G audio     "$REAL_USER"
 
 # ── 3. D-Bus user session (fixes PulseAudio BT on OPi) ───────────────────
 echo ""
@@ -199,6 +195,20 @@ cat > /usr/local/bin/uac-gadget.sh << 'EOF'
 #!/bin/bash
 modprobe libcomposite
 
+GADGET_DIR="/sys/kernel/config/usb_gadget/uac_gadget"
+
+# Proper teardown in correct order
+if [ -d "$GADGET_DIR" ]; then
+    echo "" > "$GADGET_DIR/UDC" 2>/dev/null || true
+    rm -f "$GADGET_DIR/configs/c.1/uac2.usb0" 2>/dev/null || true
+    rmdir "$GADGET_DIR/configs/c.1/strings/0x409" 2>/dev/null || true
+    rmdir "$GADGET_DIR/configs/c.1" 2>/dev/null || true
+    rmdir "$GADGET_DIR/functions/uac2.usb0" 2>/dev/null || true
+    rmdir "$GADGET_DIR/strings/0x409" 2>/dev/null || true
+    rmdir "$GADGET_DIR" 2>/dev/null || true
+    sleep 1
+fi
+
 cd /sys/kernel/config/usb_gadget/
 mkdir -p uac_gadget
 cd uac_gadget
@@ -224,7 +234,7 @@ echo 3 > functions/uac2.usb0/p_chmask
 echo 4 > functions/uac2.usb0/c_ssize
 echo 4 > functions/uac2.usb0/p_ssize
 
-ln -sf functions/uac2.usb0 configs/c.1/ 2>/dev/null || true
+ln -sf functions/uac2.usb0 configs/c.1/
 
 UDC=$(ls /sys/class/udc | head -1)
 echo $UDC > UDC
@@ -681,14 +691,21 @@ wget -O "$BRIDGE_DIR/server_bridge.py" \
 
 chmod +x "$BRIDGE_DIR/server_bridge.py"
 
+# Fix ttyS0 permissions — OPi assigns it to console user by default
+cat > /etc/udev/rules.d/99-ttys0.rules << 'EOF'
+KERNEL=="ttyS0", GROUP="dialout", MODE="0660"
+EOF
+udevadm control --reload-rules
+udevadm trigger --subsystem-match=tty
+chown root:dialout /dev/ttyS0 2>/dev/null || true
+chmod 660 /dev/ttyS0 2>/dev/null || true
+
 touch /etc/zone_password.hash
 chown "$REAL_USER:$REAL_USER" /etc/zone_password.hash
 chmod 640 /etc/zone_password.hash
 
 # OPi Zero 3 UART: use UART5 on PH2/PH3 = /dev/ttyS5
 # Make sure to enable it in orangepiEnv.txt if not already
-grep -q "uart5" /boot/orangepiEnv.txt 2>/dev/null || \
-    echo "overlays=uart5" >> /boot/orangepiEnv.txt
 
 cat > /etc/systemd/system/esp-bridge-server.service << EOF
 [Unit]
@@ -699,7 +716,7 @@ After=network.target snapserver.service bluetooth.service bt-init.service
 Type=simple
 User=$REAL_USER
 ExecStart=/usr/bin/python3 ${BRIDGE_DIR}/server_bridge.py \
-    --port /dev/ttyS5 \
+    --port /dev/ttyS0 \
     --baud 460800
 Restart=always
 RestartSec=3
@@ -810,7 +827,7 @@ echo "   uac-gadget         — USB UAC audio gadget"
 echo "   snapserver         — Snapcast server (reads /tmp/snapfifo)"
 echo "   bt-init            — USB BT dongle (hci1) init"
 echo "   bt-agent           — auto-pair agent"
-echo "   esp-bridge-server  — server_bridge.py on /dev/ttyS5"
+echo "   esp-bridge-server  — server_bridge.py on /dev/ttyS0"
 echo ""
 echo " Input mode services (bridge-controlled, disabled at boot):"
 echo "   snapcast-source    — USB/UAC phone input"
@@ -825,9 +842,9 @@ echo "   - UAC via libcomposite (musb-hdrc OTG), not dwc2"
 echo "   - dbus-user-session required for PulseAudio BT"
 echo ""
 echo " Wiring (OPi Zero 3 pinout):"
-echo "   PH2 (TX, pin on header) → ESP32 RX"
-echo "   PH3 (RX, pin on header) → ESP32 TX"
-echo "   GND → ESP32 GND"
+echo "   Debug header TX → ESP32 RX"
+echo "   Debug header RX → ESP32 TX"
+echo "   Debug header GND → ESP32 GND"
 echo "   USB-C → phone (UAC gadget)"
 echo ""
 echo " Network:"
