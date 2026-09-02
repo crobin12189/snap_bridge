@@ -48,10 +48,6 @@ echo "[0/13] Creating new admin user: $NEW_USER..."
 useradd -m -s /bin/bash "$NEW_USER"
 echo "$NEW_USER:$NEW_PASS" | chpasswd
 usermod -aG sudo,bluetooth,dialout "$NEW_USER"
-# Add pulse/gpio groups only if they exist (created after apt install)
-for grp in pulse pulse-access gpio; do
-    getent group "$grp" &>/dev/null && usermod -aG "$grp" "$NEW_USER" || true
-done
 
 # Give full passwordless sudo
 echo "$NEW_USER ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/99-newadmin
